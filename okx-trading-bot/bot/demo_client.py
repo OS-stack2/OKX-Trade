@@ -61,6 +61,28 @@ class SpotFeeRates:
     taker: Decimal
 
 
+@dataclass(frozen=True)
+class DemoOrder:
+    client_order_id: str
+    order_id: str
+    state: str
+    size_btc: Decimal
+    filled_btc: Decimal
+    limit_price_usdt: Decimal
+    checked_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class DemoFill:
+    trade_id: str
+    order_id: str
+    size_btc: Decimal
+    price_usdt: Decimal
+    fee: Decimal
+    fee_currency: str
+    observed_at_utc: datetime
+
+
 def _http_get_json(request: Request, timeout: float) -> Any:
     with urlopen(request, timeout=timeout) as response:
         return json.load(response)
@@ -97,7 +119,10 @@ class DemoClient:
     _PENDING = "/api/v5/trade/orders-pending"
     _FILLS = "/api/v5/trade/fills-history"
     _TRADE_FEE = "/api/v5/account/trade-fee"
-    _ALLOWED_PATHS = frozenset({_BALANCE, _PENDING, _FILLS, _TRADE_FEE})
+    _ORDER_INFO = "/api/v5/trade/order"
+    _ORDER_FILLS = "/api/v5/trade/fills"
+    _ALLOWED_PATHS = frozenset({_BALANCE, _PENDING, _FILLS, _TRADE_FEE,
+                                _ORDER_INFO, _ORDER_FILLS})
 
     def __init__(
         self,
@@ -271,6 +296,64 @@ class DemoClient:
         row = rows[0]
         return SpotFeeRates(_signed_rate(row.get("maker"), "maker"),
                             _signed_rate(row.get("taker"), "taker"))
+
+    def get_order_by_client_id(self, client_order_id: str) -> DemoOrder:
+        """Read exactly one Demo BTC-USDT cash LIMIT BUY by its persisted ID."""
+        if not isinstance(client_order_id, str) or not re.fullmatch(r"TB[a-f0-9]{30}", client_order_id):
+            raise DemoError("Некорректный clientOrderId для Demo-сверки")
+        rows = self._get(self._ORDER_INFO, {"instId": "BTC-USDT", "clOrdId": client_order_id})
+        if len(rows) != 1:
+            raise DemoError("Demo-ордер по clientOrderId не найден однозначно")
+        row = rows[0]
+        order_id = row.get("ordId")
+        if (row.get("instType") != "SPOT" or row.get("instId") != "BTC-USDT"
+                or row.get("tdMode") != "cash" or row.get("side") != "buy"
+                or row.get("ordType") != "limit" or row.get("clOrdId") != client_order_id
+                or not isinstance(order_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", order_id)
+                or row.get("state") not in ("live", "partially_filled", "filled", "canceled")):
+            raise DemoError("Demo-ордер противоречит ожидаемому BTC-USDT LIMIT BUY")
+        size = _amount(row.get("sz"), "размер ордера")
+        filled = _amount(row.get("accFillSz"), "исполненный размер")
+        price = _amount(row.get("px"), "цена ордера")
+        if (size <= 0 or price <= 0 or filled > size
+                or (row["state"] == "live" and filled != 0)
+                or (row["state"] == "partially_filled" and not 0 < filled < size)
+                or (row["state"] == "filled" and filled != size)):
+            raise DemoError("Размер, цена или состояние Demo-ордера противоречивы")
+        return DemoOrder(client_order_id, order_id, row["state"], size, filled,
+                         price, self._clock())
+
+    def get_order_fills(self, order_id: str) -> tuple[DemoFill, ...]:
+        """Read recent per-order fills; a full page is treated as incomplete."""
+        if not isinstance(order_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", order_id):
+            raise DemoError("Некорректный ordId для Demo-сверки")
+        rows = self._get(self._ORDER_FILLS, {"instType": "SPOT", "instId": "BTC-USDT",
+                                             "ordId": order_id, "limit": "100"})
+        if len(rows) >= 100:
+            raise DemoError("История исполнений ордера достигла лимита страницы; полнота не доказана")
+        fills: list[DemoFill] = []
+        seen: set[str] = set()
+        for row in rows:
+            trade_id = row.get("tradeId")
+            fee_ccy = row.get("feeCcy")
+            if (row.get("instType") != "SPOT" or row.get("instId") != "BTC-USDT"
+                    or row.get("ordId") != order_id or row.get("side") != "buy"
+                    or not isinstance(trade_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", trade_id)
+                    or trade_id in seen or fee_ccy not in ("BTC", "USDT")):
+                raise DemoError("История исполнений Demo-ордера противоречива")
+            seen.add(trade_id)
+            size = _amount(row.get("fillSz"), "размер исполнения")
+            price = _amount(row.get("fillPx"), "цена исполнения")
+            try:
+                fee = Decimal(row.get("fee"))
+                observed = datetime.fromtimestamp(int(row["ts"]) / 1000, tz=timezone.utc)
+            except (InvalidOperation, TypeError, ValueError, KeyError, OverflowError, OSError) as exc:
+                raise DemoError("Комиссия исполнения Demo-ордера неизвестна") from exc
+            if (size <= 0 or price <= 0 or not fee.is_finite() or fee > 0
+                    or observed > self._clock()):
+                raise DemoError("Размер, цена или комиссия исполнения Demo-ордера некорректны")
+            fills.append(DemoFill(trade_id, order_id, size, price, fee, fee_ccy, observed))
+        return tuple(fills)
 
     def check_account(self) -> DemoSummary:
         btc, usdt = self.get_balances()

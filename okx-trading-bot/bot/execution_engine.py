@@ -369,6 +369,23 @@ class ExecutionEngine:
             raise ExecutionError("Решение или закрытая свеча устарели")
         return row, candle
 
+    def preview_candidate(
+        self, *, reconciliation: ReconcileReport, instrument: InstrumentLimits,
+        costs: ExecutionCosts, entry_price: Decimal,
+        max_size_btc_verified: bool, slippage_verified: bool,
+    ) -> RiskDecision:
+        """Read-only Risk Manager calculation; never creates an intent or reservation."""
+        if max_size_btc_verified is not True or slippage_verified is not True:
+            raise ExecutionError("Лимит BTC и ожидаемое проскальзывание не подтверждены")
+        diagnostic = self.diagnose()
+        if diagnostic.blocked:
+            raise ExecutionError("Состояние исполнителя блокирует новый BUY")
+        now = self.clock()
+        _utc(now, "Время предварительной проверки")
+        decision = self._risk_preview(reconciliation, instrument, costs, entry_price, now)
+        self._validate_protection(decision, instrument)
+        return decision
+
     def plan_buy(
         self, *, decision_id: str, reconciliation: ReconcileReport,
         instrument: InstrumentLimits, costs: ExecutionCosts, entry_price: Decimal,
@@ -527,6 +544,21 @@ class ExecutionEngine:
             if intent.state != ExecutionState.SUBMITTING:
                 raise ExecutionError("ACK допустим только после SUBMITTING")
             return self._transition(db, intent, ExecutionState.ACKNOWLEDGED, "EXCHANGE_ACK", order_id=exchange_order_id)
+
+    def record_reconciled_ack(self, client_order_id: str, exchange_order_id: str) -> ExecutionIntent:
+        """Accept a separately verified GET result after an ambiguous send."""
+        with self._write() as db:
+            self._clear(db)
+            intent = self._get(db, client_order_id)
+            if intent.exchange_order_id is not None and intent.exchange_order_id != exchange_order_id:
+                raise ExecutionError("Биржевой ordId противоречит сохранённому намерению")
+            if intent.state in (ExecutionState.SUBMITTING, ExecutionState.UNKNOWN):
+                return self._transition(db, intent, ExecutionState.ACKNOWLEDGED,
+                                        "READ_ONLY_ORDER_MATCH", order_id=exchange_order_id)
+            if (intent.state in (ExecutionState.ACKNOWLEDGED, ExecutionState.PARTIALLY_FILLED,
+                                 ExecutionState.FILLED) and intent.exchange_order_id == exchange_order_id):
+                return intent
+            raise ExecutionError("Ордер не соответствует ожидающему намерению")
 
     def record_uncertain(self, client_order_id: str, *, timeout: bool) -> ExecutionIntent:
         """Timeout/ambiguous response is UNKNOWN; never retry the order."""

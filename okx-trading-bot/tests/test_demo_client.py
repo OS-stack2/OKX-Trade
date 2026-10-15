@@ -56,6 +56,67 @@ class DemoClientTests(unittest.TestCase):
             **kwargs,
         )
 
+    def test_read_only_order_lookup_and_fills_are_demo_get_only(self):
+        client_id = "TB" + "a" * 30
+        seen = []
+
+        def transport(request, timeout):
+            seen.append(request)
+            self.assertEqual(request.get_method(), "GET")
+            self.assertEqual(dict((k.lower(), v) for k, v in request.header_items())["x-simulated-trading"], "1")
+            parsed = urlsplit(request.full_url)
+            if parsed.path == "/api/v5/trade/order":
+                self.assertEqual(parse_qs(parsed.query), {"instId": ["BTC-USDT"], "clOrdId": [client_id]})
+                data = [{"instType": "SPOT", "instId": "BTC-USDT", "tdMode": "cash",
+                         "side": "buy", "ordType": "limit", "clOrdId": client_id,
+                         "ordId": "123", "state": "partially_filled", "sz": "0.01",
+                         "accFillSz": "0.005", "px": "80000"}]
+            elif parsed.path == "/api/v5/trade/fills":
+                self.assertEqual(parse_qs(parsed.query), {"instType": ["SPOT"],
+                    "instId": ["BTC-USDT"], "ordId": ["123"], "limit": ["100"]})
+                data = [{"instType": "SPOT", "instId": "BTC-USDT", "ordId": "123",
+                         "side": "buy", "tradeId": "t1", "fillSz": "0.005",
+                         "fillPx": "79999", "fee": "-0.4", "feeCcy": "USDT",
+                         "ts": str(int(FIXED_TIME.timestamp() * 1000))}]
+            else:
+                raise AssertionError("Unexpected endpoint")
+            return {"code": "0", "data": data}
+
+        client = self.client(transport)
+        order = client.get_order_by_client_id(client_id)
+        fills = client.get_order_fills(order.order_id)
+        self.assertEqual((order.filled_btc, fills[0].fee), (Decimal("0.005"), Decimal("-0.4")))
+        self.assertEqual(len(seen), 2)
+
+    def test_order_lookup_rejects_wrong_side_and_ambiguous_response(self):
+        client_id = "TB" + "b" * 30
+        def transport(request, timeout):
+            return {"code": "0", "data": [{"instType": "SPOT", "instId": "BTC-USDT",
+                "tdMode": "cash", "side": "sell", "ordType": "limit", "clOrdId": client_id,
+                "ordId": "123", "state": "live", "sz": "0.01", "accFillSz": "0",
+                "px": "80000"}]}
+        with self.assertRaises(DemoError):
+            self.client(transport).get_order_by_client_id(client_id)
+        with self.assertRaises(DemoError):
+            self.client(lambda request, timeout: {"code": "0", "data": []}).get_order_by_client_id(client_id)
+
+    def test_order_status_timeout_retries_get_only_and_stops(self):
+        client_id = "TB" + "c" * 30
+        methods = []
+        def timeout(request, seconds):
+            methods.append(request.get_method())
+            raise TimeoutError("offline timeout")
+        with self.assertRaises(DemoError):
+            self.client(timeout, sleeper=lambda seconds: None).get_order_by_client_id(client_id)
+        self.assertEqual(methods, ["GET"] * 3)
+
+    def test_full_order_fill_page_is_not_treated_as_complete(self):
+        row = {"instType": "SPOT", "instId": "BTC-USDT", "ordId": "123", "side": "buy",
+               "tradeId": "one", "fillSz": "0.001", "fillPx": "80000",
+               "fee": "-0.01", "feeCcy": "USDT"}
+        with self.assertRaises(DemoError):
+            self.client(lambda request, timeout: {"code": "0", "data": [row] * 100}).get_order_fills("123")
+
     def test_signature_is_hmac_of_timestamp_method_and_exact_encoded_path(self):
         requests = []
 
@@ -231,7 +292,8 @@ class DemoClientTests(unittest.TestCase):
 
     def test_private_order_and_transfer_paths_are_blocked_before_network(self):
         client = self.client(lambda request, timeout: self.fail("network must not be used"))
-        for path in ("/api/v5/trade/order", "/api/v5/trade/cancel-order", "/api/v5/asset/transfer"):
+        for path in ("/api/v5/trade/cancel-order", "/api/v5/trade/order-algo",
+                     "/api/v5/asset/transfer"):
             with self.subTest(path=path), self.assertRaisesRegex(DemoError, "Запрещённый"):
                 client._get(path, {})
         for name in ("place_order", "amend_order", "cancel_order", "transfer"):
@@ -243,6 +305,13 @@ class DemoClientTests(unittest.TestCase):
              patch.object(main, "OkxClient", side_effect=AssertionError("public request")), redirect_stderr(error):
             self.assertEqual(main.main(["--demo-check"]), 1)
         self.assertIn("Demo-счёта", error.getvalue())
+
+    def test_order_preview_missing_demo_config_stops_before_public_request(self):
+        error = StringIO()
+        with patch.object(main.DemoClient, "from_env_file", side_effect=ConfigError("Нет локального .env")), \
+             patch.object(main, "OkxClient", side_effect=AssertionError("public request")), redirect_stderr(error):
+            self.assertEqual(main.main(["--order-preview"]), 1)
+        self.assertIn("BLOCK", error.getvalue())
 
 
 if __name__ == "__main__":

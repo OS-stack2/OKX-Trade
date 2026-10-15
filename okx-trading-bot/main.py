@@ -11,6 +11,7 @@ from bot.execution_engine import ExecutionEngine
 from bot.journal import DecisionJournal, JournalError
 from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
+from bot.order_preview import preview_demo_buy
 from bot.risk_manager import RiskManager
 from bot.reconcile import DemoReconciler
 from bot.budget_setup import BudgetInitializer
@@ -30,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--budget-preview", action="store_true", help="Inspect the one-time 5000 USDT Demo allocation")
     commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
     commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
+    commands.add_argument("--order-preview", action="store_true", help="Read-only, blocked Demo LIMIT BUY preview")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
@@ -46,6 +48,48 @@ def main(argv: list[str] | None = None) -> int:
                   f"BTC после комиссии: {intent.owned_btc}")
         print("Команда не подключается к OKX, не разрешает отправку и не создаёт ордера")
         return 1 if report.blocked else 0
+
+    if args.order_preview:
+        try:
+            demo_client = DemoClient.from_env_file()
+            market = get_market_snapshot(OkxClient(demo_client.config))
+            signal = evaluate_signal(market.candles)
+            journal = DecisionJournal()
+            risk_manager = RiskManager()
+            store = StrategyBudgetStore(journal.path)
+            report = DemoReconciler(market_provider=lambda: market, demo_client=demo_client,
+                                    journal=journal, risk_manager=risk_manager,
+                                    budget_store=store).run_once()
+            preview = preview_demo_buy(market=market, signal=signal, reconciliation=report,
+                                       engine=ExecutionEngine(journal=journal,
+                                                              risk_manager=risk_manager,
+                                                              budget_store=store))
+        except (ConfigError, DemoError, OkxError, StrategyError, ValueError):
+            print("OKX Demo BTC-USDT LIMIT BUY: BLOCK — данные для предварительного плана недоступны", file=sys.stderr)
+            return 1
+        print(f"OKX Demo BTC-USDT LIMIT BUY — предварительный план: {preview.status}")
+        print(f"Сигнал EMA: {preview.signal or 'неизвестен'}")
+        if preview.candle_closed_at is not None:
+            print(f"Закрытая свеча: {preview.candle_closed_at:%Y-%m-%d %H:%M:%S} UTC")
+        if preview.reference_price_usdt is not None:
+            print(f"Справочная цена BTC: {preview.reference_price_usdt} USDT")
+        if preview.estimated_entry_usdt is not None:
+            print(f"Оценка LIMIT-входа: {preview.estimated_entry_usdt}; "
+                  f"SL 1%: {preview.estimated_stop_usdt}; TP 2%: {preview.estimated_take_usdt} USDT")
+        if preview.virtual_usdt_available is not None:
+            print(f"Виртуальный доступный USDT: {preview.virtual_usdt_available}")
+        if preview.external_btc is not None:
+            print(f"Внешний BTC: {preview.external_btc}; продажа запрещена")
+        if report.per_trade_risk_limit_usdt is not None:
+            print(f"Лимит Risk Manager на сделку: {report.per_trade_risk_limit_usdt} USDT; "
+                  f"дневной остаток: {report.daily_risk_remaining_usdt} USDT")
+        if preview.quantity_btc is not None:
+            print(f"Гипотетический размер: {preview.quantity_btc} BTC; "
+                  f"риск {preview.estimated_risk_usdt} USDT; стоимость {preview.estimated_cost_usdt} USDT")
+        for reason in preview.reasons:
+            print(f"Причина BLOCK: {reason}")
+        print("Ордер и защитные Algo-ордера не создавались; SQLite и лимиты не изменялись")
+        return 1
 
     if args.budget_preview or args.confirm_budget is not None:
         try:

@@ -9,6 +9,7 @@ from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -16,11 +17,16 @@ from unittest.mock import patch
 import main
 from bot.execution_engine import (ExecutionEngine, ExecutionError, ExecutionState,
                                   RECOVERY_PHRASE, RecoveryProof)
+from bot.demo_client import DemoError, DemoFill, DemoOrder
 from bot.journal import CycleDraft, CycleStatus, DecisionJournal
-from bot.market_data import SpotInstrument
+from bot.market_data import MarketSnapshot, SpotInstrument
+from bot.order_observer import DemoOrderObserver
+from bot.order_preview import PROTECTION_BLOCK, preview_demo_buy
 from bot.reconcile import ReconcileReport, ReconcileStatus
 from bot.risk_manager import AccountSnapshot, ExecutionCosts, InstrumentLimits, RiskManager
+from bot.strategy import Signal, StrategyResult
 from bot.strategy_budget import BudgetBaseline, StrategyBudgetStore
+from config import Config
 
 
 NOW = datetime(2026, 10, 15, 12, 30, tzinfo=timezone.utc)
@@ -357,6 +363,142 @@ class ExecutionEngineTests(unittest.TestCase):
             content = file.read()
         for secret in (b"fake-secret", b"OK-ACCESS-KEY", b"x-simulated-trading", b"passphrase"):
             self.assertNotIn(secret, content)
+
+    def test_complete_buy_candidate_still_blocks_unproven_atomic_protection(self):
+        market = MarketSnapshot(SPOT, D("80000"), (), NOW)
+        signal = StrategyResult(Signal.BUY, D("2"), D("1"), D("1"), D("2"),
+                                NOW - timedelta(minutes=15), "cross")
+        before = self.manager.state_path.read_bytes()
+        preview = preview_demo_buy(market=market, signal=signal,
+            reconciliation=self.report, engine=self.engine,
+            verified_max_size_btc=D("0.1"), verified_costs=COSTS, now_utc=NOW)
+        self.assertEqual(preview.status, "BLOCK")
+        self.assertIn(PROTECTION_BLOCK, preview.reasons)
+        self.assertEqual(preview.quantity_btc, self.decision.quantity)
+        self.assertEqual((preview.estimated_stop_usdt, preview.estimated_take_usdt),
+                         (D("79200.0"), D("81600.0")))
+        self.assertEqual(self.manager.state_path.read_bytes(), before)
+        self.assertEqual(self.engine.diagnose().intents, ())
+
+    def test_preview_missing_evidence_and_sell_never_target_external_btc(self):
+        market = MarketSnapshot(SPOT, D("80000"), (), NOW)
+        sell = StrategyResult(Signal.SELL, D("1"), D("2"), D("2"), D("1"),
+                              NOW - timedelta(minutes=15), "cross")
+        preview = preview_demo_buy(market=market, signal=sell,
+            reconciliation=self.report, engine=self.engine, now_utc=NOW)
+        self.assertEqual(preview.status, "BLOCK")
+        self.assertIsNone(preview.quantity_btc)
+        self.assertEqual(preview.external_btc, D("1"))
+        self.assertTrue(any("BTC" in reason for reason in preview.reasons))
+
+    def test_preview_rejects_minimum_size_and_invalid_price(self):
+        signal = StrategyResult(Signal.BUY, D("2"), D("1"), D("1"), D("2"),
+                                NOW - timedelta(minutes=15), "cross")
+        too_large_minimum = MarketSnapshot(replace(SPOT, min_size=D("0.2")),
+                                           D("80000"), (), NOW)
+        denied = preview_demo_buy(market=too_large_minimum, signal=signal,
+            reconciliation=self.report, engine=self.engine,
+            verified_max_size_btc=D("0.1"), verified_costs=COSTS, now_utc=NOW)
+        self.assertEqual(denied.status, "BLOCK")
+        self.assertIsNone(denied.quantity_btc)
+        invalid_price = preview_demo_buy(market=MarketSnapshot(SPOT, D("NaN"), (), NOW),
+            signal=signal, reconciliation=self.report, engine=self.engine, now_utc=NOW)
+        self.assertIsNone(invalid_price.estimated_entry_usdt)
+        self.assertTrue(any("Цена" in reason for reason in invalid_price.reasons))
+
+    def _submitting_intent(self):
+        intent = self.validate(self.plan())
+        self.engine.mark_submitting(intent.client_order_id, risk_confirmation=self.reserve())
+        return intent
+
+    def test_read_only_order_observation_is_idempotent_and_halts_partial_fill(self):
+        intent = self._submitting_intent()
+        class Reader:
+            def get_order_by_client_id(self, client_id):
+                return DemoOrder(client_id, "order1", "partially_filled", intent.quantity,
+                                 D("0.01"), intent.entry_price, NOW)
+            def get_order_fills(self, order_id):
+                return (DemoFill("trade1", order_id, D("0.01"), D("80000"),
+                                 D("-0.8"), "USDT", NOW),)
+        observer = DemoOrderObserver(client=Reader(), engine=self.engine, clock=lambda: NOW)
+        first = observer.observe(intent.client_order_id)
+        second = observer.observe(intent.client_order_id)
+        self.assertTrue(first.halted)
+        self.assertTrue(second.halted)
+        self.assertEqual(second.intents[0].filled_quantity, D("0.01"))
+        with self.assertRaises(ExecutionError):
+            self.engine.manual_recover(phrase=RECOVERY_PHRASE, proof=RecoveryProof(
+                intent.client_order_id, NOW, True, True, True, "OKX_DEMO_READ_ONLY"))
+        with closing(sqlite3.connect(self.journal.path)) as db:
+            with closing(db.execute("SELECT COUNT(*) FROM execution_fills")) as cursor:
+                self.assertEqual(cursor.fetchone()[0], 1)
+
+    def test_read_only_order_timeout_halts_and_survives_restart(self):
+        intent = self._submitting_intent()
+        class Reader:
+            def get_order_by_client_id(self, client_id):
+                raise DemoError("read-only timeout")
+        result = DemoOrderObserver(client=Reader(), engine=self.engine,
+                                   clock=lambda: NOW).observe(intent.client_order_id)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.intents[0].state, ExecutionState.HALTED)
+        self.assertTrue(ExecutionEngine(journal=self.journal).diagnose().halted)
+        proof = RecoveryProof(intent.client_order_id, NOW, True, True, True, "OKX_DEMO_READ_ONLY")
+        with self.assertRaises(ExecutionError):
+            self.engine.manual_recover(phrase="incorrect", proof=proof)
+        self.engine.manual_recover(phrase=RECOVERY_PHRASE, proof=proof)
+        self.assertEqual(self.engine.diagnose().intents[0].state, ExecutionState.REJECTED)
+
+    def test_unknown_order_lookup_is_not_resubmitted_and_halts(self):
+        intent = self._submitting_intent()
+        self.engine.record_uncertain(intent.client_order_id, timeout=True)
+        class Reader:
+            def get_order_by_client_id(self, client_id):
+                return DemoOrder(client_id, "order2", "live", intent.quantity,
+                                 D(0), intent.entry_price, NOW)
+            def get_order_fills(self, order_id):
+                return ()
+        result = DemoOrderObserver(client=Reader(), engine=self.engine,
+                                   clock=lambda: NOW).observe(intent.client_order_id)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.intents[0].exchange_order_id, "order2")
+
+    def test_incomplete_partial_fill_history_halts_without_guessing(self):
+        intent = self._submitting_intent()
+        class Reader:
+            def get_order_by_client_id(self, client_id):
+                return DemoOrder(client_id, "order3", "partially_filled", intent.quantity,
+                                 D("0.01"), intent.entry_price, NOW)
+            def get_order_fills(self, order_id):
+                return ()
+        result = DemoOrderObserver(client=Reader(), engine=self.engine,
+                                   clock=lambda: NOW).observe(intent.client_order_id)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.intents[0].filled_quantity, D(0))
+
+    def test_order_preview_cli_is_read_only_and_shows_block_reasons(self):
+        market = MarketSnapshot(SPOT, D("80000"), (), NOW)
+        signal = StrategyResult(Signal.BUY, D("2"), D("1"), D("1"), D("2"),
+                                NOW - timedelta(minutes=15), "cross")
+        risk_before = self.manager.state_path.read_bytes()
+        journal_before = self.journal.path.read_bytes()
+        client = SimpleNamespace(config=Config(region="eea", mode="DEMO"))
+        output = StringIO()
+        with (patch.object(main.DemoClient, "from_env_file", return_value=client),
+              patch.object(main, "get_market_snapshot", return_value=market),
+              patch.object(main, "evaluate_signal", return_value=signal),
+              patch.object(main, "DecisionJournal", return_value=self.journal),
+              patch.object(main, "RiskManager", return_value=self.manager),
+              patch.object(main, "StrategyBudgetStore", return_value=self.store),
+              patch.object(main, "ExecutionEngine", return_value=self.engine),
+              patch.object(main, "DemoReconciler") as reconciler,
+              redirect_stdout(output)):
+            reconciler.return_value.run_once.return_value = self.report
+            self.assertEqual(main.main(["--order-preview"]), 1)
+        self.assertIn("BLOCK", output.getvalue())
+        self.assertIn("SL 1%", output.getvalue())
+        self.assertEqual(self.manager.state_path.read_bytes(), risk_before)
+        self.assertEqual(self.journal.path.read_bytes(), journal_before)
 
 
 if __name__ == "__main__":
