@@ -97,6 +97,17 @@ class ProtectionTests(unittest.TestCase):
         self.assertTrue(any("фактический размер" in reason for reason in short.reasons))
         self.assertTrue(self.engine.diagnose().halted)
 
+    def test_delayed_algo_ids_never_retroactively_protect_earlier_fill(self):
+        first = self.ledger.record(self.observation(stop=None, take=None))
+        self.assertEqual(first.uncovered_btc, D("0.02"))
+        later = self.ledger.record(self.observation())
+        self.assertEqual(later.confirmed_covered_btc, D("0.02"))
+        self.assertTrue(any("Атомарность" in reason for reason in later.reasons))
+        self.assertTrue(self.engine.diagnose().halted)
+        with closing(sqlite3.connect(self.journal.path)) as db:
+            with closing(db.execute("SELECT uncovered_btc FROM protection_observations ORDER BY rowid")) as cursor:
+                self.assertEqual([D(row[0]) for row in cursor.fetchall()], [D("0.02"), D(0)])
+
     def test_algo_ids_parent_and_demo_identity_must_match(self):
         stop, take = self.legs()
         for bad_stop in (replace(stop, algo_id=take.algo_id),

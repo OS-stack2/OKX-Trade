@@ -12,6 +12,7 @@ from bot.journal import DecisionJournal, JournalError
 from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
 from bot.order_preview import preview_demo_buy
+from bot.protection_capabilities import inspect_protection_capabilities
 from bot.risk_manager import RiskManager
 from bot.reconcile import DemoReconciler
 from bot.budget_setup import BudgetInitializer
@@ -32,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
     commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
     commands.add_argument("--order-preview", action="store_true", help="Read-only, blocked Demo LIMIT BUY preview")
+    commands.add_argument("--protection-capabilities", action="store_true", help="GET-only Demo attached TP/SL capability inventory")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
@@ -48,6 +50,30 @@ def main(argv: list[str] | None = None) -> int:
                   f"BTC после комиссии: {intent.owned_btc}")
         print("Команда не подключается к OKX, не разрешает отправку и не создаёт ордера")
         return 1 if report.blocked else 0
+
+    if args.protection_capabilities:
+        try:
+            demo_client = DemoClient.from_env_file()
+        except (ConfigError, DemoError):
+            print("Возможности защиты: BLOCK — локальный Demo Read-only ключ или регион не настроен", file=sys.stderr)
+            return 1
+        try:
+            report = inspect_protection_capabilities(
+                public_client=OkxClient(demo_client.config), demo_client=demo_client,
+                engine=ExecutionEngine(journal=DecisionJournal()),
+            )
+        except Exception:
+            print("Возможности защиты: BLOCK — GET-диагностика недоступна или противоречива", file=sys.stderr)
+            return 1
+        print(f"OKX Demo BTC-USDT SPOT attached TP/SL: {report.status}")
+        for item in report.sdk_evidence:
+            print(f"Официальный SDK (описание API): {item}")
+        for item in report.api_observations:
+            print(f"Наблюдение GET API/SQLite: {item}")
+        for item in report.unknowns:
+            print(f"Не подтверждено: {item}")
+        print("GET-диагностика не записывала SQLite и не отправляла торговые запросы")
+        return 1
 
     if args.order_preview:
         try:

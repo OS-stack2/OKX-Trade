@@ -83,6 +83,17 @@ class DemoFill:
     observed_at_utc: datetime
 
 
+@dataclass(frozen=True)
+class DemoAlgoOrder:
+    """Read-only Algo observation; no parent/OCO proof is inferred from it."""
+
+    algo_id: str
+    order_type: str
+    state: str
+    size_btc: Decimal | None
+    side: str
+
+
 def _http_get_json(request: Request, timeout: float) -> Any:
     with urlopen(request, timeout=timeout) as response:
         return json.load(response)
@@ -121,8 +132,10 @@ class DemoClient:
     _TRADE_FEE = "/api/v5/account/trade-fee"
     _ORDER_INFO = "/api/v5/trade/order"
     _ORDER_FILLS = "/api/v5/trade/fills"
+    _ALGO_PENDING = "/api/v5/trade/orders-algo-pending"
+    _ALGO_INFO = "/api/v5/trade/order-algo"
     _ALLOWED_PATHS = frozenset({_BALANCE, _PENDING, _FILLS, _TRADE_FEE,
-                                _ORDER_INFO, _ORDER_FILLS})
+                                _ORDER_INFO, _ORDER_FILLS, _ALGO_PENDING, _ALGO_INFO})
 
     def __init__(
         self,
@@ -354,6 +367,66 @@ class DemoClient:
                 raise DemoError("Размер, цена или комиссия исполнения Demo-ордера некорректны")
             fills.append(DemoFill(trade_id, order_id, size, price, fee, fee_ccy, observed))
         return tuple(fills)
+
+    @staticmethod
+    def _algo_row(row: dict[str, Any], *, expected_id: str | None = None,
+                  expected_type: str | None = None) -> DemoAlgoOrder:
+        algo_id = row.get("algoId")
+        order_type = row.get("ordType")
+        state = row.get("state")
+        side = row.get("side")
+        if (row.get("instType") != "SPOT" or row.get("instId") != "BTC-USDT"
+                or not isinstance(algo_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", algo_id) is None
+                or (expected_id is not None and algo_id != expected_id)
+                or not isinstance(order_type, str) or not order_type
+                or (expected_type is not None and order_type != expected_type)
+                or not isinstance(state, str) or not state
+                or side not in ("buy", "sell")):
+            raise DemoError("Demo Algo-ордер противоречит BTC-USDT SPOT или его идентификатору")
+        raw_size = row.get("sz")
+        size = None if raw_size in (None, "") else _amount(raw_size, "размер Algo-ордера")
+        return DemoAlgoOrder(algo_id, order_type, state, size, side)
+
+    def get_pending_algo_orders(self) -> tuple[DemoAlgoOrder, ...]:
+        """Read conditional and OCO pending Algo pages, without inferring coverage.
+
+        These two order types do not establish that all possible attached types
+        were returned. A full page always requires a further GET page.
+        """
+        orders: list[DemoAlgoOrder] = []
+        seen: set[str] = set()
+        for order_type in ("conditional", "oco"):
+            after = ""
+            for _ in range(10):
+                params = {"ordType": order_type, "instType": "SPOT",
+                          "instId": "BTC-USDT", "limit": "100"}
+                if after:
+                    params["after"] = after
+                page = self._get(self._ALGO_PENDING, params)
+                if len(page) > 100:
+                    raise DemoError("Demo API вернул слишком много Algo-ордеров")
+                for row in page:
+                    order = self._algo_row(row, expected_type=order_type)
+                    if order.algo_id in seen:
+                        raise DemoError("Demo API вернул повторный Algo ID")
+                    seen.add(order.algo_id)
+                    orders.append(order)
+                if len(page) < 100:
+                    break
+                after = orders[-1].algo_id
+            else:
+                raise DemoError("Полнота списка Demo Algo-ордеров не доказана")
+        return tuple(orders)
+
+    def get_algo_order_by_id(self, algo_id: str) -> DemoAlgoOrder:
+        """Read one saved exchange Algo ID; never search by guessed IDs."""
+        if not isinstance(algo_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", algo_id) is None:
+            raise DemoError("Некорректный Algo ID для Demo-сверки")
+        rows = self._get(self._ALGO_INFO, {"algoId": algo_id})
+        if len(rows) != 1:
+            raise DemoError("Demo Algo ID не найден однозначно")
+        return self._algo_row(rows[0], expected_id=algo_id)
 
     def check_account(self) -> DemoSummary:
         btc, usdt = self.get_balances()

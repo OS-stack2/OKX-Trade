@@ -65,11 +65,12 @@ def _one_record(data: list[Any], field: str) -> dict[str, Any]:
     return data[0]
 
 
-def get_market_snapshot(client: OkxClient) -> MarketSnapshot:
+def read_spot_instrument(client: OkxClient) -> SpotInstrument:
+    """Read only the public BTC-USDT SPOT instrument, without ticker/candles."""
     instrument_data = _one_record(client.get_spot_instrument(), "instrument")
     if instrument_data.get("instId") != "BTC-USDT" or instrument_data.get("instType") != "SPOT":
         raise OkxResponseError("Unexpected instrument returned by OKX")
-    instrument = SpotInstrument(
+    return SpotInstrument(
         instrument_id="BTC-USDT",
         tick_size=_positive_decimal(instrument_data.get("tickSz"), "tickSz"),
         lot_size=_positive_decimal(instrument_data.get("lotSz"), "lotSz"),
@@ -82,6 +83,10 @@ def get_market_snapshot(client: OkxClient) -> MarketSnapshot:
         max_market_size=(_positive_decimal(instrument_data["maxMktSz"], "maxMktSz")
                          if instrument_data.get("maxMktSz") not in (None, "") else None),
     )
+
+
+def get_market_snapshot(client: OkxClient) -> MarketSnapshot:
+    instrument = read_spot_instrument(client)
 
     ticker_data = _one_record(client.get_ticker(), "ticker")
     if ticker_data.get("instId") != "BTC-USDT":

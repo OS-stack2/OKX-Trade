@@ -292,11 +292,12 @@ class DemoClientTests(unittest.TestCase):
 
     def test_private_order_and_transfer_paths_are_blocked_before_network(self):
         client = self.client(lambda request, timeout: self.fail("network must not be used"))
-        for path in ("/api/v5/trade/cancel-order", "/api/v5/trade/order-algo",
+        for path in ("/api/v5/trade/cancel-order", "/api/v5/trade/cancel-algos",
                      "/api/v5/asset/transfer"):
             with self.subTest(path=path), self.assertRaisesRegex(DemoError, "Запрещённый"):
                 client._get(path, {})
-        for name in ("place_order", "amend_order", "cancel_order", "transfer"):
+        for name in ("place_order", "amend_order", "cancel_order", "place_algo_order",
+                     "amend_algo_order", "cancel_algo_order", "transfer"):
             self.assertFalse(hasattr(client, name))
 
     def test_cli_reports_missing_credentials_without_public_request(self):

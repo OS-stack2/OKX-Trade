@@ -67,6 +67,8 @@ class ProtectionAssessment:
     uncovered_btc: Decimal
     reasons: tuple[str, ...]
     halted: bool = True
+    stop_algo_id: str | None = None
+    take_algo_id: str | None = None
 
 
 def _positive(value: object) -> bool:
@@ -162,7 +164,9 @@ def assess_protection(intent: ExecutionIntent, observation: BuyObservation,
     if covered < owned:
         reasons.append("Есть BTC бота без подтверждённого SL; новые сделки запрещены")
     return ProtectionAssessment(intent.client_order_id, observation.state, owned,
-                                covered, owned - covered, tuple(reasons))
+                                covered, owned - covered, tuple(reasons), True,
+                                observation.stop.algo_id if isinstance(observation.stop, AlgoLeg) else None,
+                                observation.take.algo_id if isinstance(observation.take, AlgoLeg) else None)
 
 
 class ProtectionJournal:
@@ -226,6 +230,7 @@ class ProtectionJournal:
                 if not isinstance(reasons, list) or not all(isinstance(x, str) for x in reasons):
                     raise ExecutionError("Причины защиты повреждены")
                 return ProtectionAssessment(row["client_order_id"], BuyState(row["buy_state"]),
-                                            owned, covered, uncovered, tuple(reasons))
+                                            owned, covered, uncovered, tuple(reasons), True,
+                                            row["stop_algo_id"], row["take_algo_id"])
         except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
             raise ExecutionError("Доказательство защиты недоступно; исполнение заблокировано") from exc
