@@ -7,6 +7,7 @@ import sys
 
 from bot.demo_client import DemoClient, DemoError
 from bot.dry_run import DryRunOrchestrator
+from bot.execution_engine import ExecutionEngine
 from bot.journal import DecisionJournal, JournalError
 from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
@@ -28,10 +29,23 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--reconcile", action="store_true", help="Read-only Demo/Risk Manager reconciliation")
     commands.add_argument("--budget-preview", action="store_true", help="Inspect the one-time 5000 USDT Demo allocation")
     commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
+    commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
         parser.error("--budget-token используется только с --confirm-budget")
+
+    if args.execution_check:
+        report = ExecutionEngine().diagnose()
+        print(f"OKX Demo BTC-USDT SPOT — локальное состояние исполнителя: {'BLOCKED' if report.blocked else 'CLEAR'}")
+        print(f"Причина: {report.reason}")
+        print(f"Аварийная остановка: {'да' if report.halted else 'нет'}; намерений: {len(report.intents)}")
+        for intent in report.intents:
+            print(f"clientOrderId: {intent.client_order_id}; состояние: {intent.state.value}; "
+                  f"объём: {intent.quantity} BTC; исполнено: {intent.filled_quantity} BTC; "
+                  f"BTC после комиссии: {intent.owned_btc}")
+        print("Команда не подключается к OKX, не разрешает отправку и не создаёт ордера")
+        return 1 if report.blocked else 0
 
     if args.budget_preview or args.confirm_budget is not None:
         try:

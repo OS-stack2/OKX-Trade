@@ -25,6 +25,7 @@ class ReconcileStatus(StrEnum):
 class ReconcileReport:
     status: ReconcileStatus
     reasons: tuple[str, ...]
+    checked_at_utc: datetime | None = None
     btc_total: Decimal | None = None
     btc_available: Decimal | None = None
     usdt_total: Decimal | None = None
@@ -221,7 +222,7 @@ class DemoReconciler:
                                   per_trade_risk_limit_usdt=(baseline.strategy_capital_usdt
                                                               * self.risk_manager.settings.risk_per_trade))
                 return ReconcileReport(ReconcileStatus.BLOCKED if reasons else ReconcileStatus.READY,
-                                       tuple(reasons), **values)
+                                       tuple(reasons), checked_at_utc=self.clock(), **values)
         reasons.append("Дневной капитал, PnL и происхождение позиции не подтверждены; риск не рассчитан")
         return ReconcileReport(ReconcileStatus.BLOCKED if reasons else ReconcileStatus.READY,
-                               tuple(reasons), **values)
+                               tuple(reasons), checked_at_utc=self.clock(), **values)
