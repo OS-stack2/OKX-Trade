@@ -1,4 +1,4 @@
-"""Configuration for public OKX checks and a future demo-only integration."""
+"""Configuration for public checks and the read-only OKX Demo integration."""
 
 from __future__ import annotations
 
@@ -46,15 +46,12 @@ class Config:
     mode: str = "READ_ONLY"
     timeout_seconds: float = 5.0
     max_attempts: int = 3
-    demo_api_key: str = ""
-    demo_api_secret: str = ""
-    demo_passphrase: str = ""
 
     def __post_init__(self) -> None:
         if self.region not in REGION_BASE_URLS:
             raise ConfigError("OKX_REGION must be global, eea, or us")
         if self.mode not in {"READ_ONLY", "DEMO"}:
-            raise ConfigError("Only READ_ONLY and future DEMO modes are allowed; LIVE is forbidden")
+            raise ConfigError("Only READ_ONLY and DEMO modes are allowed; LIVE is forbidden")
         if not 0 < self.timeout_seconds <= 60:
             raise ConfigError("OKX_TIMEOUT_SECONDS must be between 0 and 60")
         if not 1 <= self.max_attempts <= 5:
@@ -80,14 +77,11 @@ class Config:
             mode=values.get("OKX_MODE", "READ_ONLY").upper(),
             timeout_seconds=timeout,
             max_attempts=attempts,
-            demo_api_key=values.get("OKX_DEMO_API_KEY", ""),
-            demo_api_secret=values.get("OKX_DEMO_API_SECRET", ""),
-            demo_passphrase=values.get("OKX_DEMO_PASSPHRASE", ""),
         )
 
 
 def demo_request_headers(config: Config) -> dict[str, str]:
-    """Guard for future private demo requests; this stage sends none."""
+    """Mandatory header for private Demo requests."""
     if config.mode != "DEMO":
         raise ConfigError("Private requests require DEMO mode")
     return {"x-simulated-trading": "1"}
