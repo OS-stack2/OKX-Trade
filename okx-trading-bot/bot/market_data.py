@@ -37,6 +37,7 @@ class MarketSnapshot:
     instrument: SpotInstrument
     last_price: Decimal
     candles: tuple[Candle, ...]
+    ticker_as_of_utc: datetime | None = None
 
     @property
     def latest_closed_candle(self) -> Candle:
@@ -74,6 +75,12 @@ def get_market_snapshot(client: OkxClient) -> MarketSnapshot:
     if ticker_data.get("instId") != "BTC-USDT":
         raise OkxResponseError("Unexpected ticker returned by OKX")
     last_price = _positive_decimal(ticker_data.get("last"), "last price")
+    ticker_as_of_utc = None
+    if "ts" in ticker_data:
+        try:
+            ticker_as_of_utc = datetime.fromtimestamp(int(ticker_data["ts"]) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            raise OkxResponseError("Invalid ticker timestamp") from exc
 
     closed: list[Candle] = []
     for row in client.get_candles(limit=101):
@@ -107,4 +114,4 @@ def get_market_snapshot(client: OkxClient) -> MarketSnapshot:
     selected = closed[:100]
     if len({item.opened_at for item in selected}) != 100:
         raise OkxResponseError("Duplicate candle timestamps returned by OKX")
-    return MarketSnapshot(instrument, last_price, tuple(reversed(selected)))
+    return MarketSnapshot(instrument, last_price, tuple(reversed(selected)), ticker_as_of_utc)

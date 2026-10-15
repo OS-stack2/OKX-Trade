@@ -77,6 +77,16 @@ class ReadOnlyTests(unittest.TestCase):
         self.assertIn("Сигнал: HOLD", output.getvalue())
         self.assertIn("Время закрытия свечи: 2024-01-02 00:00:00 UTC", output.getvalue())
 
+    def test_ticker_timestamp_is_available_for_dry_run_freshness(self) -> None:
+        def transport(url: str, timeout: float) -> dict:
+            payload = response_for(url, timeout)
+            if urlsplit(url).path == "/api/v5/market/ticker":
+                payload["data"][0]["ts"] = str(START_MS)
+            return payload
+
+        snapshot = get_market_snapshot(OkxClient(Config(), transport=transport))
+        self.assertEqual(snapshot.ticker_as_of_utc, datetime(2024, 1, 2, tzinfo=timezone.utc))
+
     def test_insufficient_closed_candles_fails(self) -> None:
         def transport(url: str, timeout: float) -> dict:
             return response_for(url, timeout, candle_rows(100))

@@ -50,6 +50,7 @@ class DemoSummary:
     usdt: CurrencyBalance
     open_order_count: int
     recent_fill_count: int
+    checked_at_utc: datetime | None = None
 
 
 def _http_get_json(request: Request, timeout: float) -> Any:
@@ -119,6 +120,11 @@ class DemoClient:
             values.get("OKX_DEMO_PASSPHRASE", ""),
         )
         return cls(config, credentials)
+
+    @property
+    def config(self) -> Config:
+        """Non-secret regional configuration for matching public requests."""
+        return self._config
 
     def _timestamp(self) -> str:
         now = self._clock()
@@ -238,6 +244,7 @@ class DemoClient:
 
     def check_account(self) -> DemoSummary:
         btc, usdt = self.get_balances()
+        balance_checked_at = datetime.now(timezone.utc)
         orders = self.get_open_orders()
         fills = self.get_fills_history()
-        return DemoSummary(btc, usdt, len(orders), len(fills))
+        return DemoSummary(btc, usdt, len(orders), len(fills), balance_checked_at)

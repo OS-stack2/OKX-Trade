@@ -210,6 +210,29 @@ class RiskManagerTests(unittest.TestCase):
         self.manager.initialize_day(next_day, tomorrow)
         self.assertEqual(self.assess(account=next_day, now_utc=tomorrow).status, RiskStatus.ALLOW)
 
+    def test_preview_buy_never_reserves_or_changes_daily_limits(self) -> None:
+        before = self.state_path.read_bytes()
+        inputs = dict(account=ACCOUNT, instrument=INSTRUMENT, costs=COSTS,
+                      entry_price=Decimal("100"), now_utc=NOW)
+        first = self.manager.preview_buy(**inputs)
+        second = self.manager.preview_buy(**inputs)
+        self.assertEqual(first.status, RiskStatus.ALLOW)
+        self.assertEqual(first.quantity, second.quantity)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertFalse(Path(f"{self.state_path}.lock").exists())
+        self.assertEqual(self.manager.assess_buy(**inputs).status, RiskStatus.ALLOW)
+
+    def test_preview_loss_and_unknown_state_fail_without_writes(self) -> None:
+        before = self.state_path.read_bytes()
+        loss = replace(ACCOUNT, realized_pnl_today_usdt=Decimal("-200"))
+        inputs = dict(account=loss, instrument=INSTRUMENT, costs=COSTS,
+                      entry_price=Decimal("100"), now_utc=NOW)
+        self.assertEqual(self.manager.preview_buy(**inputs).status, RiskStatus.DENY)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.state_path.unlink()
+        self.assertEqual(self.manager.preview_buy(**inputs).status, RiskStatus.DENY)
+        self.assertFalse(self.state_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

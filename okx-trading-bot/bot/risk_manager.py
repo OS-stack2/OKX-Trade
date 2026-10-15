@@ -151,6 +151,10 @@ class RiskManager:
         if type(self.settings.max_snapshot_age_seconds) is not int or self.settings.max_snapshot_age_seconds < 1:
             raise RiskStateError("Некорректен срок актуальности снимка счёта")
 
+    def validate_settings(self) -> None:
+        """Check risk settings without reading or mutating daily state."""
+        self._validate_settings()
+
     def _validate_account(self, account: AccountSnapshot, now_utc: datetime) -> None:
         if not isinstance(account, AccountSnapshot):
             raise RiskStateError("Состояние счёта неизвестно")
@@ -270,6 +274,91 @@ class RiskManager:
             locked = self._daily_loss(account) >= account.day_start_capital_usdt * self.settings.daily_loss_limit_pct
             self._save(_DailyState(account.day_utc, account.day_start_capital_usdt, account.entries_today, False, locked))
 
+    def _prepared_state(self, account: AccountSnapshot, now: datetime, state: _DailyState) -> _DailyState:
+        if state.day_utc != now.date():
+            raise RiskStateError("Нет состояния для текущих суток UTC")
+        if state.start_capital_usdt != account.day_start_capital_usdt:
+            raise RiskStateError("Капитал на начало суток противоречит сохранённому значению")
+        if not state.pending_entry and account.entries_today < state.entries_used:
+            raise RiskStateError("История входов противоречит сохранённому счётчику")
+        if state.pending_entry and account.entries_today > state.entries_used:
+            raise RiskStateError("При зарезервированном входе обнаружены другие входы; нужна сверка")
+        return replace(state, entries_used=max(state.entries_used, account.entries_today))
+
+    def _evaluate_buy(
+        self,
+        account: AccountSnapshot,
+        instrument: InstrumentLimits | None,
+        costs: ExecutionCosts | None,
+        entry_price: Decimal | None,
+        state: _DailyState,
+        *,
+        preview: bool,
+    ) -> tuple[RiskDecision, _DailyState]:
+        daily_limit = state.start_capital_usdt * self.settings.daily_loss_limit_pct
+        daily_loss = self._daily_loss(account)
+        if state.loss_locked:
+            return RiskDecision(RiskStatus.DENY, "Дневной лимит убытка уже заблокировал новые входы"), state
+        if daily_loss >= daily_limit:
+            return RiskDecision(RiskStatus.DENY, "Достигнут дневной лимит реализованного и нереализованного убытка"), replace(state, loss_locked=True)
+        if account.open_positions >= self.settings.max_open_positions:
+            return RiskDecision(RiskStatus.DENY, "Есть открытая позиция; усреднение и новый вход запрещены"), state
+        if account.pending_orders:
+            return RiskDecision(RiskStatus.DENY, "Есть незавершённый ордер; состояние входа не определено"), state
+        if state.pending_entry:
+            return RiskDecision(RiskStatus.DENY, "Предыдущий вход уже зарезервирован"), state
+        if state.entries_used >= self.settings.max_new_entries_per_day:
+            return RiskDecision(RiskStatus.DENY, "Достигнут суточный лимит новых входов"), state
+
+        self._validate_instrument(instrument)
+        self._validate_costs(costs)
+        price = _decimal(entry_price, "Цена входа", positive=True)
+        assert instrument is not None and costs is not None
+        entry = _ceil_step(price, instrument.tick_size)
+        stop = _floor_step(entry * (ONE - self.settings.stop_loss_pct), instrument.tick_size)
+        take_profit = _ceil_step(entry * (ONE + self.settings.take_profit_pct), instrument.tick_size)
+        if stop <= ZERO or stop >= entry or take_profit <= entry:
+            raise RiskStateError("Ценовой шаг делает стоп или тейк некорректным")
+
+        entry_cost_per_unit = entry * (ONE + costs.entry_slippage_rate) * (ONE + costs.entry_fee_rate)
+        stop_proceeds_per_unit = stop * (ONE - costs.stop_slippage_rate) * (ONE - costs.exit_fee_rate)
+        loss_per_unit = entry_cost_per_unit - stop_proceeds_per_unit
+        if loss_per_unit <= ZERO:
+            raise RiskStateError("Невозможно оценить убыток на единицу позиции")
+        risk_budget = min(account.equity_usdt * self.settings.risk_per_trade, daily_limit - daily_loss)
+        minimum = _ceil_step(instrument.min_size, instrument.lot_size)
+        maximum = _floor_step(instrument.max_size, instrument.lot_size)
+        if minimum > maximum:
+            raise RiskStateError("Минимальный лот выше максимального размера OKX")
+        if minimum * loss_per_unit > risk_budget:
+            return RiskDecision(RiskStatus.DENY, "Минимальный лот превышает допустимый риск", entry_price=entry, stop_price=stop, take_profit_price=take_profit), state
+        if minimum * entry_cost_per_unit > account.available_usdt:
+            return RiskDecision(RiskStatus.DENY, "Недостаточно доступного USDT даже для минимального лота", entry_price=entry, stop_price=stop, take_profit_price=take_profit), state
+
+        quantity = min(
+            _floor_step(risk_budget / loss_per_unit, instrument.lot_size),
+            _floor_step(account.available_usdt / entry_cost_per_unit, instrument.lot_size),
+            maximum,
+        )
+        if quantity < minimum:
+            raise RiskStateError("Размер после округления ниже минимального лота")
+        estimated_risk = quantity * loss_per_unit
+        estimated_cost = quantity * entry_cost_per_unit
+        if estimated_risk > risk_budget or estimated_cost > account.available_usdt or quantity > maximum:
+            raise RiskStateError("Округлённый размер нарушает лимит риска, баланса или инструмента")
+        decision = RiskDecision(
+            status=RiskStatus.ALLOW,
+            reason=("Риск и лимиты соблюдены; гипотетический вход без резервирования"
+                    if preview else "Риск и лимиты соблюдены; один вход зарезервирован без отправки ордера"),
+            quantity=quantity,
+            entry_price=entry,
+            stop_price=stop,
+            take_profit_price=take_profit,
+            estimated_risk_usdt=estimated_risk,
+            estimated_cost_usdt=estimated_cost,
+        )
+        return decision, replace(state, entries_used=state.entries_used + 1, pending_entry=True)
+
     def assess_buy(
         self,
         *,
@@ -287,87 +376,47 @@ class RiskManager:
             assert account is not None
             with self._exclusive():
                 state = self._load()
-                if state.day_utc != now.date():
-                    raise RiskStateError("Нет состояния для текущих суток UTC")
-                if state.start_capital_usdt != account.day_start_capital_usdt:
-                    raise RiskStateError("Капитал на начало суток противоречит сохранённому значению")
-                if not state.pending_entry and account.entries_today < state.entries_used:
-                    raise RiskStateError("История входов противоречит сохранённому счётчику")
-                if state.pending_entry and account.entries_today > state.entries_used:
-                    raise RiskStateError("При зарезервированном входе обнаружены другие входы; нужна сверка")
-                entries_used = max(state.entries_used, account.entries_today)
-                if entries_used != state.entries_used:
-                    state = replace(state, entries_used=entries_used)
+                prepared = self._prepared_state(account, now, state)
+                if prepared != state:
+                    state = prepared
                     self._save(state)
-                daily_limit = state.start_capital_usdt * self.settings.daily_loss_limit_pct
-                daily_loss = self._daily_loss(account)
-                if state.loss_locked:
-                    return RiskDecision(RiskStatus.DENY, "Дневной лимит убытка уже заблокировал новые входы")
-                if daily_loss >= daily_limit:
-                    self._save(replace(state, loss_locked=True))
-                    return RiskDecision(RiskStatus.DENY, "Достигнут дневной лимит реализованного и нереализованного убытка")
-                if account.open_positions >= self.settings.max_open_positions:
-                    return RiskDecision(RiskStatus.DENY, "Есть открытая позиция; усреднение и новый вход запрещены")
-                if account.pending_orders:
-                    return RiskDecision(RiskStatus.DENY, "Есть незавершённый ордер; состояние входа не определено")
-                if state.pending_entry:
-                    return RiskDecision(RiskStatus.DENY, "Предыдущий вход уже зарезервирован")
-                if entries_used >= self.settings.max_new_entries_per_day:
-                    return RiskDecision(RiskStatus.DENY, "Достигнут суточный лимит новых входов")
-
-                self._validate_instrument(instrument)
-                self._validate_costs(costs)
-                price = _decimal(entry_price, "Цена входа", positive=True)
-                assert instrument is not None and costs is not None
-                entry = _ceil_step(price, instrument.tick_size)
-                stop = _floor_step(entry * (ONE - self.settings.stop_loss_pct), instrument.tick_size)
-                take_profit = _ceil_step(entry * (ONE + self.settings.take_profit_pct), instrument.tick_size)
-                if stop <= ZERO or stop >= entry or take_profit <= entry:
-                    raise RiskStateError("Ценовой шаг делает стоп или тейк некорректным")
-
-                entry_cost_per_unit = entry * (ONE + costs.entry_slippage_rate) * (ONE + costs.entry_fee_rate)
-                stop_proceeds_per_unit = stop * (ONE - costs.stop_slippage_rate) * (ONE - costs.exit_fee_rate)
-                loss_per_unit = entry_cost_per_unit - stop_proceeds_per_unit
-                if loss_per_unit <= ZERO:
-                    raise RiskStateError("Невозможно оценить убыток на единицу позиции")
-                risk_budget = min(
-                    account.equity_usdt * self.settings.risk_per_trade,
-                    daily_limit - daily_loss,
-                )
-                minimum = _ceil_step(instrument.min_size, instrument.lot_size)
-                maximum = _floor_step(instrument.max_size, instrument.lot_size)
-                if minimum > maximum:
-                    raise RiskStateError("Минимальный лот выше максимального размера OKX")
-                if minimum * loss_per_unit > risk_budget:
-                    return RiskDecision(RiskStatus.DENY, "Минимальный лот превышает допустимый риск", entry_price=entry, stop_price=stop, take_profit_price=take_profit)
-                if minimum * entry_cost_per_unit > account.available_usdt:
-                    return RiskDecision(RiskStatus.DENY, "Недостаточно доступного USDT даже для минимального лота", entry_price=entry, stop_price=stop, take_profit_price=take_profit)
-
-                quantity = min(
-                    _floor_step(risk_budget / loss_per_unit, instrument.lot_size),
-                    _floor_step(account.available_usdt / entry_cost_per_unit, instrument.lot_size),
-                    maximum,
-                )
-                if quantity < minimum:
-                    raise RiskStateError("Размер после округления ниже минимального лота")
-                estimated_risk = quantity * loss_per_unit
-                estimated_cost = quantity * entry_cost_per_unit
-                if estimated_risk > risk_budget or estimated_cost > account.available_usdt or quantity > maximum:
-                    raise RiskStateError("Округлённый размер нарушает лимит риска, баланса или инструмента")
-                decision = RiskDecision(
-                    status=RiskStatus.ALLOW,
-                    reason="Риск и лимиты соблюдены; один вход зарезервирован без отправки ордера",
-                    quantity=quantity,
-                    entry_price=entry,
-                    stop_price=stop,
-                    take_profit_price=take_profit,
-                    estimated_risk_usdt=estimated_risk,
-                    estimated_cost_usdt=estimated_cost,
-                )
-                self._save(replace(state, entries_used=entries_used + 1, pending_entry=True))
+                decision, updated = self._evaluate_buy(account, instrument, costs, entry_price, state, preview=False)
+                if updated != state:
+                    self._save(updated)
                 return decision
-        except (RiskStateError, OSError, DecimalException, OverflowError, TypeError, ValueError) as exc:
+        except RiskStateError as exc:
             return RiskDecision(RiskStatus.DENY, f"Проверка риска отклонена: {exc}")
+        except (OSError, DecimalException, OverflowError, TypeError, ValueError):
+            return RiskDecision(RiskStatus.DENY, "Проверка риска отклонена: некорректные данные или ошибка чтения состояния")
+
+    def preview_buy(
+        self,
+        *,
+        account: AccountSnapshot | None = None,
+        instrument: InstrumentLimits | None = None,
+        costs: ExecutionCosts | None = None,
+        entry_price: Decimal | None = None,
+        now_utc: datetime | None = None,
+    ) -> RiskDecision:
+        """Evaluate a hypothetical BUY without locks, reservations or state writes."""
+        try:
+            self._validate_settings()
+            now = _utc_time(now_utc, "Текущее время")
+            self._validate_account(account, now)
+            assert account is not None
+            lock_path = Path(f"{self.state_path}.lock")
+            if lock_path.exists():
+                raise RiskStateError("Состояние риска занято или требует восстановления")
+            state = self._load()
+            if lock_path.exists():
+                raise RiskStateError("Состояние риска занято или требует восстановления")
+            prepared = self._prepared_state(account, now, state)
+            decision, _ = self._evaluate_buy(account, instrument, costs, entry_price, prepared, preview=True)
+            return decision
+        except RiskStateError as exc:
+            return RiskDecision(RiskStatus.DENY, f"Проверка риска отклонена: {exc}")
+        except (OSError, DecimalException, OverflowError, TypeError, ValueError):
+            return RiskDecision(RiskStatus.DENY, "Проверка риска отклонена: некорректные данные или ошибка чтения состояния")
 
     def reconcile_confirmed_entry(self, account: AccountSnapshot, now_utc: datetime) -> bool:
         """Clear a reservation only after trusted account history confirms its entry.
