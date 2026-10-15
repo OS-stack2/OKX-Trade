@@ -13,6 +13,7 @@ from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
 from bot.order_preview import preview_demo_buy
 from bot.protection_capabilities import inspect_protection_capabilities
+from bot.protection_simulator import SimulationConfig, SimulationError, parse_price_path, run_sample_scenarios
 from bot.risk_manager import RiskManager
 from bot.reconcile import DemoReconciler
 from bot.budget_setup import BudgetInitializer
@@ -34,10 +35,47 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
     commands.add_argument("--order-preview", action="store_true", help="Read-only, blocked Demo LIMIT BUY preview")
     commands.add_argument("--protection-capabilities", action="store_true", help="GET-only Demo attached TP/SL capability inventory")
+    commands.add_argument("--protection-simulate", action="store_true", help="Offline BUY/SL/TP lifecycle scenarios in temporary SQLite")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
+    parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
         parser.error("--budget-token используется только с --confirm-budget")
+    if args.sim_price_path is not None and not args.protection_simulate:
+        parser.error("--sim-price-path используется только с --protection-simulate")
+
+    if args.protection_simulate:
+        try:
+            prices = parse_price_path(args.sim_price_path or "80000,79200,78400")
+            settings = SimulationConfig()
+            reports = run_sample_scenarios(prices)
+        except SimulationError:
+            print("Симуляция защиты: BLOCK — цены или временные события некорректны", file=sys.stderr)
+            return 1
+        print("OKX Demo BTC-USDT SPOT — только офлайн-симуляция, решение: BLOCK")
+        print(f"Учебный BUY: {settings.planned_btc} BTC по {settings.entry_usdt} USDT; "
+              f"SL 1%: {settings.stop_usdt}; TP 2%: {settings.take_usdt} USDT")
+        print(f"Учебные шаги: minSz {settings.min_size_btc}, lotSz {settings.lot_size_btc}, "
+              f"tickSz {settings.tick_usdt}; оценка выхода: комиссия {settings.exit_fee_rate}, "
+              f"проскальзывание {settings.exit_slippage_rate}")
+        for name, result in reports:
+            duration = ("неизвестна" if result.unprotected_seconds is None
+                        else f"{result.unprotected_seconds} с")
+            print(f"\n{name}: {result.decision}; BUY {result.buy_state}; "
+                  f"HALTED {'да' if result.halted else 'нет'}")
+            print(f"BTC бота: куплено {result.bot_owned_btc}, осталось {result.bot_remaining_btc}; "
+                  f"учебный OCO-резерв {result.simulated_reserved_btc}, "
+                  f"без подтверждённого SL {result.uncovered_btc}; "
+                  f"внешний BTC {result.external_btc} не использовался")
+            print(f"Время известной незащищённой позиции: {duration}")
+            for price, loss in result.price_losses_usdt:
+                estimate = "неизвестен" if loss is None else f"{loss} USDT"
+                print(f"При условной цене {price} USDT возможный убыток: {estimate}")
+            for reason in result.reasons:
+                print(f"Причина BLOCK/HALTED: {reason}")
+        print("Потери — условная оценка выхода по заданным ценам, не верхняя граница риска.")
+        print("Исполнение не разрешено; API, рабочая SQLite, бюджет и Risk Manager не изменялись.")
+        return 1
 
     if args.execution_check:
         report = ExecutionEngine().diagnose()
