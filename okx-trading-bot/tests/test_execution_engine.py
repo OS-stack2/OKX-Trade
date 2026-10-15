@@ -476,6 +476,37 @@ class ExecutionEngineTests(unittest.TestCase):
         self.assertTrue(result.halted)
         self.assertEqual(result.intents[0].filled_quantity, D(0))
 
+    def test_partially_filled_then_canceled_records_owned_btc_and_halts(self):
+        intent = self._submitting_intent()
+        class Reader:
+            def get_order_by_client_id(self, client_id):
+                return DemoOrder(client_id, "order-canceled", "canceled", intent.quantity,
+                                 D("0.01"), intent.entry_price, NOW)
+            def get_order_fills(self, order_id):
+                return (DemoFill("trade-canceled", order_id, D("0.01"), D("80000"),
+                                 D("-0.8"), "USDT", NOW),)
+        result = DemoOrderObserver(client=Reader(), engine=self.engine,
+                                   clock=lambda: NOW).observe(intent.client_order_id)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.intents[0].owned_btc, D("0.01"))
+        with closing(sqlite3.connect(self.journal.path)) as db:
+            with closing(db.execute("SELECT reason_code FROM execution_control WHERE id=1")) as cursor:
+                self.assertEqual(cursor.fetchone()[0], "PARTIAL_BUY_CANCELED")
+
+    def test_claimed_full_fill_with_partial_volume_halts_without_recording(self):
+        intent = self._submitting_intent()
+        class Reader:
+            def get_order_by_client_id(self, client_id):
+                return DemoOrder(client_id, "order-contradictory", "filled", intent.quantity,
+                                 D("0.01"), intent.entry_price, NOW)
+            def get_order_fills(self, order_id):
+                return (DemoFill("trade-contradictory", order_id, D("0.01"), D("80000"),
+                                 D("-0.8"), "USDT", NOW),)
+        result = DemoOrderObserver(client=Reader(), engine=self.engine,
+                                   clock=lambda: NOW).observe(intent.client_order_id)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.intents[0].filled_quantity, D(0))
+
     def test_order_preview_cli_is_read_only_and_shows_block_reasons(self):
         market = MarketSnapshot(SPOT, D("80000"), (), NOW)
         signal = StrategyResult(Signal.BUY, D("2"), D("1"), D("1"), D("2"),

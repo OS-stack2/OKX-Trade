@@ -67,6 +67,12 @@ class DemoOrderObserver:
                 total += fill.size_btc
             if total != order.filled_btc:
                 raise DemoError("Исполненный размер не подтверждён полной историей")
+            if ((order.state == "filled" and order.filled_btc != order.size_btc)
+                    or (order.state == "partially_filled"
+                        and not Decimal(0) < order.filled_btc < order.size_btc)
+                    or (order.state == "live" and order.filled_btc != 0)
+                    or (order.state == "canceled" and order.filled_btc == order.size_btc)):
+                raise DemoError("Статус BUY противоречит фактическому исполнению")
             if not diagnostic.halted:
                 self.engine.record_reconciled_ack(client_order_id, order.order_id)
             for fill in fills:
@@ -75,7 +81,11 @@ class DemoOrderObserver:
                                         fee=fill.fee, fee_ccy=fill.fee_currency,
                                         exchange_order_id=order.order_id)
             # Even a live unfilled order can fill without atomically proven SL/TP.
-            self.engine.emergency_halt("UNPROTECTED_DEMO_ORDER")
+            reason = ("PARTIAL_BUY_ACTIVE" if order.state == "partially_filled" else
+                      "PARTIAL_BUY_CANCELED" if order.state == "canceled" and order.filled_btc > 0 else
+                      "FILLED_BUY_UNPROTECTED" if order.state == "filled" else
+                      "UNPROTECTED_DEMO_ORDER")
+            self.engine.emergency_halt(reason)
         except (DemoError, ExecutionError, OSError, TypeError, ValueError):
             self.engine.emergency_halt("ORDER_STATUS_UNCERTAIN")
         return self.engine.diagnose()

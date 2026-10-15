@@ -55,7 +55,8 @@ def preview_demo_buy(
 ) -> OrderPreview:
     """Show a risk candidate when fully evidenced, but always block execution."""
     now = now_utc or datetime.now(timezone.utc)
-    reasons = [PROTECTION_BLOCK]
+    reasons = [PROTECTION_BLOCK,
+               "Поддержка attached TP/SL для BTC-USDT SPOT Demo и региона аккаунта не подтверждена"]
     entry = stop = take = quantity = risk = cost = reference = None
     candle = signal.candle_closed_at if isinstance(signal, StrategyResult) else None
     signal_text = signal.signal.value if isinstance(signal, StrategyResult) and isinstance(signal.signal, Signal) else None
@@ -106,7 +107,7 @@ def preview_demo_buy(
     if not isinstance(verified_costs, ExecutionCosts):
         reasons.append("Комиссии и ожидаемое проскальзывание не подтверждены")
 
-    if len(reasons) == 1 and entry is not None and isinstance(market, MarketSnapshot):
+    if len(reasons) == 2 and entry is not None and isinstance(market, MarketSnapshot):
         try:
             spot = market.instrument
             limits = InstrumentLimits("BTC-USDT", "live", spot.min_size,
