@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import StringIO
@@ -224,8 +224,10 @@ class ExecutionEngineTests(unittest.TestCase):
     def test_deleted_halt_control_cannot_be_recreated_as_clear(self):
         self.plan()
         self.engine.emergency_halt()
-        with sqlite3.connect(self.journal.path) as db:
-            db.execute("DELETE FROM execution_control")
+        # Connection.__exit__ handles the transaction but does not close the file.
+        with closing(sqlite3.connect(self.journal.path)) as db, db:
+            with closing(db.execute("DELETE FROM execution_control")):
+                pass
         self.assertTrue(self.engine.diagnose().blocked)
         with self.assertRaises(ExecutionError):
             self.plan()
@@ -278,8 +280,71 @@ class ExecutionEngineTests(unittest.TestCase):
         self.engine.record_fill(intent.client_order_id, trade_id="fill1", quantity=D("0.02"),
             price=D("80000"), fee=D("0"), fee_ccy="USDT", exchange_order_id="ord4")
         self.assertTrue(self.engine.diagnose().halted)
-        with sqlite3.connect(self.journal.path) as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM execution_fills").fetchone()[0], 1)
+        with closing(sqlite3.connect(self.journal.path)) as db:
+            with closing(db.execute("SELECT COUNT(*) FROM execution_fills")) as cursor:
+                self.assertEqual(cursor.fetchone()[0], 1)
+
+    def test_sqlite_resources_close_on_success_and_exception(self):
+        class TrackedConnection(sqlite3.Connection):
+            closed = False
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        path = self.root / "resource_check.sqlite3"
+        with closing(sqlite3.connect(path, factory=TrackedConnection)) as db, db:
+            with closing(db.execute("CREATE TABLE sample (value INTEGER)")) as cursor:
+                pass
+        self.assertTrue(db.closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            cursor.fetchone()
+
+        with self.assertRaisesRegex(RuntimeError, "stop before cleanup"):
+            with closing(sqlite3.connect(path, factory=TrackedConnection)) as failed_db, failed_db:
+                with closing(failed_db.execute("INSERT INTO sample VALUES (1)")) as failed_cursor:
+                    raise RuntimeError("stop before cleanup")
+        self.assertTrue(failed_db.closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            failed_db.execute("SELECT 1")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            failed_cursor.fetchone()
+        with closing(sqlite3.connect(path)) as check_db:
+            with closing(check_db.execute("SELECT COUNT(*) FROM sample")) as cursor:
+                self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_engine_transaction_closes_connection_and_rolls_back_on_error(self):
+        class TrackedConnection(sqlite3.Connection):
+            closed = False
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        opened = []
+        real_connect = sqlite3.connect
+
+        def tracked_connect(*args, **kwargs):
+            connection = real_connect(*args, factory=TrackedConnection, **kwargs)
+            opened.append(connection)
+            return connection
+
+        with patch("bot.execution_engine.sqlite3.connect", side_effect=tracked_connect):
+            with self.engine._transaction() as db:
+                with closing(db.execute("CREATE TABLE resource_check (value INTEGER)")):
+                    pass
+            with self.assertRaisesRegex(RuntimeError, "abort transaction"):
+                with self.engine._transaction() as db:
+                    with closing(db.execute("INSERT INTO resource_check VALUES (1)")):
+                        raise RuntimeError("abort transaction")
+
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(all(connection.closed for connection in opened))
+        with closing(sqlite3.connect(self.journal.path)) as db:
+            with closing(db.execute("SELECT COUNT(*) FROM resource_check")) as cursor:
+                self.assertEqual(cursor.fetchone()[0], 0)
 
     def test_cli_offline_and_no_secrets_in_ledger(self):
         with patch("bot.demo_client.DemoClient.from_env_file", side_effect=AssertionError("network")):

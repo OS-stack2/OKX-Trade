@@ -143,6 +143,20 @@ class ExecutionEngine:
         self.path = Path(self.journal.path)
         self.clock = clock
 
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """Commit or roll back before closing SQLite, including on exceptions."""
+        with closing(sqlite3.connect(self.path, timeout=3)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA synchronous=FULL")
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                yield db
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+
     @staticmethod
     def _schema(db: sqlite3.Connection) -> None:
         db.execute("PRAGMA foreign_keys=ON")
@@ -373,10 +387,7 @@ class ExecutionEngine:
             raise ExecutionError("SQLite-журнал решений отсутствует")
         try:
             self.journal.audit_read_only()
-            with closing(sqlite3.connect(self.path, timeout=3)) as db:
-                db.row_factory = sqlite3.Row
-                db.execute("PRAGMA synchronous=FULL")
-                db.execute("BEGIN IMMEDIATE")
+            with self._transaction() as db:
                 self._schema(db)
                 control = db.execute("SELECT halted FROM execution_control WHERE id=1").fetchone()
                 if control is None or control["halted"] != 0:
@@ -411,7 +422,6 @@ class ExecutionEngine:
                 db.execute("INSERT INTO execution_events (client_order_id,from_state,to_state,reason_code,at_utc) VALUES (?,NULL,'PLANNED','PLANNED',?)",
                            (client_id, _utc(now, "Время")))
                 intent = self._get(db, client_id)
-                db.commit()
                 return intent
         except (sqlite3.Error, OSError, JournalError, RiskStateError, InvalidOperation, TypeError, ValueError) as exc:
             if isinstance(exc, ExecutionError):
@@ -424,13 +434,9 @@ class ExecutionEngine:
             raise ExecutionError("SQLite-журнал решений отсутствует")
         try:
             self.journal.audit_read_only()
-            with closing(sqlite3.connect(self.path, timeout=3)) as db:
-                db.row_factory = sqlite3.Row
-                db.execute("PRAGMA synchronous=FULL")
-                db.execute("BEGIN IMMEDIATE")
+            with self._transaction() as db:
                 self._schema(db)
                 yield db
-                db.commit()
         except (sqlite3.Error, OSError, JournalError) as exc:
             raise ExecutionError("Состояние исполнения не удалось безопасно сохранить") from exc
 
