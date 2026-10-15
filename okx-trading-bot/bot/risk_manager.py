@@ -97,6 +97,17 @@ class _DailyState:
     loss_locked: bool
 
 
+@dataclass(frozen=True)
+class DailyRiskSnapshot:
+    """Read-only view of a previously, explicitly initialized UTC day."""
+
+    day_utc: date
+    start_capital_usdt: Decimal
+    entries_used: int
+    pending_entry: bool
+    loss_locked: bool
+
+
 def _decimal(value: object, name: str, *, positive: bool = False) -> Decimal:
     if not isinstance(value, Decimal) or not value.is_finite():
         raise RiskStateError(f"{name}: требуется конечное значение Decimal")
@@ -154,6 +165,19 @@ class RiskManager:
     def validate_settings(self) -> None:
         """Check risk settings without reading or mutating daily state."""
         self._validate_settings()
+
+    def inspect_daily_state(self, now_utc: datetime) -> DailyRiskSnapshot:
+        """Read existing limits without initializing a day or changing a lock."""
+        self._validate_settings()
+        now = _utc_time(now_utc, "Текущее время")
+        lock_path = Path(f"{self.state_path}.lock")
+        if lock_path.exists():
+            raise RiskStateError("Состояние риска занято или требует восстановления")
+        state = self._load()
+        if lock_path.exists() or state.day_utc != now.date():
+            raise RiskStateError("Нет подтверждённого состояния риска для текущих суток UTC")
+        return DailyRiskSnapshot(state.day_utc, state.start_capital_usdt,
+                                 state.entries_used, state.pending_entry, state.loss_locked)
 
     def _validate_account(self, account: AccountSnapshot, now_utc: datetime) -> None:
         if not isinstance(account, AccountSnapshot):

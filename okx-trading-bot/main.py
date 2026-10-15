@@ -11,6 +11,7 @@ from bot.journal import DecisionJournal, JournalError
 from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
 from bot.risk_manager import RiskManager
+from bot.reconcile import DemoReconciler
 from bot.strategy import StrategyError, evaluate_signal
 from config import Config, ConfigError
 
@@ -22,7 +23,48 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--signal", action="store_true", help="Calculate the EMA 9/21 signal once")
     commands.add_argument("--demo-check", action="store_true", help="Read the virtual OKX Demo account once")
     commands.add_argument("--dry-run", action="store_true", help="Record one non-executing Demo analysis cycle")
+    commands.add_argument("--reconcile", action="store_true", help="Read-only Demo/Risk Manager reconciliation")
     args = parser.parse_args(argv)
+
+    if args.reconcile:
+        try:
+            demo_client = DemoClient.from_env_file()
+        except (ConfigError, DemoError):
+            print("Сверка: BLOCKED — локальный Demo-режим или Read-only API-ключ недоступен", file=sys.stderr)
+            return 1
+        report = DemoReconciler(
+            market_provider=lambda: get_market_snapshot(OkxClient(demo_client.config)),
+            demo_client=demo_client, journal=DecisionJournal(), risk_manager=RiskManager(),
+        ).run_once()
+        print(f"Сверка OKX Demo BTC-USDT SPOT: {report.status.value}")
+        if report.btc_total is not None and report.usdt_total is not None:
+            print(f"Виртуальный баланс: BTC {report.btc_total} (доступно {report.btc_available}), "
+                  f"USDT {report.usdt_total} (доступно {report.usdt_available})")
+        if report.portfolio_value_usdt is not None:
+            print(f"Оценка BTC+USDT: {report.portfolio_value_usdt} USDT при цене BTC {report.btc_price_usdt}")
+        if report.external_btc is not None:
+            print(f"Внешний BTC: {report.external_btc}; учтённая позиция бота: 0 BTC; продажа запрещена")
+        if report.open_order_count is not None and report.fill_count is not None:
+            print(f"Открытых SPOT-ордеров: {report.open_order_count}; исполнений в ответе: {report.fill_count}")
+        if report.fees_by_currency is not None:
+            print("Комиссии исполнений в ответе: " + ", ".join(f"{ccy} {fee}" for ccy, fee in report.fees_by_currency))
+        if report.maker_fee_rate is not None:
+            print(f"Ставки OKX (знак как в API): maker {report.maker_fee_rate}, taker {report.taker_fee_rate}")
+        if report.instrument is not None:
+            instrument = report.instrument
+            print(f"Ограничения BTC-USDT: min {instrument.min_size}, шаг {instrument.lot_size}, "
+                  f"тик {instrument.tick_size}, maxLmtSz {instrument.max_limit_size}, "
+                  f"maxMktSz {instrument.max_market_size} (единицы полей OKX)")
+        if report.confirmed_realized_pnl_usdt is not None:
+            print(f"Подтверждённый PnL: реализованный {report.confirmed_realized_pnl_usdt}, "
+                  f"нереализованный {report.confirmed_unrealized_pnl_usdt} USDT")
+            print(f"Дневной риск: убыток {report.daily_loss_usdt}, предел {report.daily_loss_limit_usdt}, "
+                  f"остаток {report.daily_risk_remaining_usdt} USDT")
+        else:
+            print("Подтверждённый PnL и дневной риск: неизвестны; дневная база не устанавливалась")
+        for reason in report.reasons:
+            print(f"Причина BLOCKED: {reason}")
+        return 0 if report.status.value == "READY" else 1
 
     if args.dry_run:
         demo_client: DemoClient | None = None

@@ -61,6 +61,13 @@ class CycleRecord:
     executed: bool = False
 
 
+@dataclass(frozen=True)
+class JournalAudit:
+    decision_count: int
+    original_count: int
+    executed_count: int
+
+
 def _utc(value: datetime | None, name: str) -> str | None:
     if value is None:
         return None
@@ -82,6 +89,41 @@ class DecisionJournal:
 
     def __init__(self, path: Path = DEFAULT_JOURNAL_PATH) -> None:
         self.path = Path(path)
+
+    def audit_read_only(self) -> JournalAudit:
+        """Inspect the durable decision ledger; never infer fills from dry-run rows."""
+        if not self.path.is_file():
+            raise JournalError("Локальный журнал решений отсутствует")
+        try:
+            uri = self.path.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=3)) as connection:
+                connection.execute("PRAGMA query_only=ON")
+                schema = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='decisions'"
+                ).fetchone()
+                if not schema or "CHECK (executed = 0)" not in schema[0]:
+                    raise JournalError("Схема журнала не подтверждает запрет исполнения")
+                rows = connection.execute(
+                    "SELECT id, status, executed, reference_id, candle_closed_at FROM decisions"
+                ).fetchall()
+                ids: set[str] = set()
+                originals = 0
+                for row_id, status, executed, reference_id, candle in rows:
+                    if (not isinstance(row_id, str) or not row_id or row_id in ids
+                            or status not in ("ALLOW", "BLOCK", "HOLD")
+                            or type(executed) is not int or executed != 0
+                            or (reference_id is not None and (not isinstance(reference_id, str) or not candle))):
+                        raise JournalError("Журнал содержит неизвестное или противоречивое решение")
+                    ids.add(row_id)
+                    originals += reference_id is None
+                references = connection.execute(
+                    "SELECT reference_id FROM decisions WHERE reference_id IS NOT NULL"
+                ).fetchall()
+                if any(ref[0] not in ids for ref in references):
+                    raise JournalError("Журнал содержит ссылку на отсутствующее решение")
+                return JournalAudit(len(rows), originals, 0)
+        except (sqlite3.Error, OSError, TypeError) as exc:
+            raise JournalError("Не удалось безопасно прочитать локальный журнал") from exc
 
     def append(self, draft: CycleDraft) -> CycleRecord:
         if not isinstance(draft, CycleDraft) or not isinstance(draft.status, CycleStatus):

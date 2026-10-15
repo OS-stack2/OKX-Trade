@@ -30,6 +30,11 @@ class SpotInstrument:
     tick_size: Decimal
     lot_size: Decimal
     min_size: Decimal
+    state: str | None = None
+    base_currency: str | None = None
+    quote_currency: str | None = None
+    max_limit_size: Decimal | None = None
+    max_market_size: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,13 @@ def get_market_snapshot(client: OkxClient) -> MarketSnapshot:
         tick_size=_positive_decimal(instrument_data.get("tickSz"), "tickSz"),
         lot_size=_positive_decimal(instrument_data.get("lotSz"), "lotSz"),
         min_size=_positive_decimal(instrument_data.get("minSz"), "minSz"),
+        state=instrument_data.get("state"),
+        base_currency=instrument_data.get("baseCcy"),
+        quote_currency=instrument_data.get("quoteCcy"),
+        max_limit_size=(_positive_decimal(instrument_data["maxLmtSz"], "maxLmtSz")
+                        if instrument_data.get("maxLmtSz") not in (None, "") else None),
+        max_market_size=(_positive_decimal(instrument_data["maxMktSz"], "maxMktSz")
+                         if instrument_data.get("maxMktSz") not in (None, "") else None),
     )
 
     ticker_data = _one_record(client.get_ticker(), "ticker")

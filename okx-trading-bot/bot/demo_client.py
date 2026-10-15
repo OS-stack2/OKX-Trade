@@ -53,6 +53,14 @@ class DemoSummary:
     checked_at_utc: datetime | None = None
 
 
+@dataclass(frozen=True)
+class SpotFeeRates:
+    """Signed OKX maker/taker rates: negative means a charged fee."""
+
+    maker: Decimal
+    taker: Decimal
+
+
 def _http_get_json(request: Request, timeout: float) -> Any:
     with urlopen(request, timeout=timeout) as response:
         return json.load(response)
@@ -70,13 +78,26 @@ def _amount(value: Any, label: str) -> Decimal:
     return number
 
 
+def _signed_rate(value: Any, label: str) -> Decimal:
+    if not isinstance(value, str) or not value.strip():
+        raise DemoError(f"Некорректная ставка Demo-комиссии: {label}")
+    try:
+        rate = Decimal(value)
+    except InvalidOperation as exc:
+        raise DemoError(f"Некорректная ставка Demo-комиссии: {label}") from exc
+    if not rate.is_finite() or not -1 < rate < 1:
+        raise DemoError(f"Некорректная ставка Demo-комиссии: {label}")
+    return rate
+
+
 class DemoClient:
-    """Only three allowlisted private GET endpoints, always in Demo mode."""
+    """Only allowlisted private GET endpoints, always in Demo mode."""
 
     _BALANCE = "/api/v5/account/balance"
     _PENDING = "/api/v5/trade/orders-pending"
     _FILLS = "/api/v5/trade/fills-history"
-    _ALLOWED_PATHS = frozenset({_BALANCE, _PENDING, _FILLS})
+    _TRADE_FEE = "/api/v5/account/trade-fee"
+    _ALLOWED_PATHS = frozenset({_BALANCE, _PENDING, _FILLS, _TRADE_FEE})
 
     def __init__(
         self,
@@ -241,6 +262,15 @@ class DemoClient:
                     or not row["tradeId"]):
                 raise DemoError("Demo API вернул некорректную историю исполнений")
         return rows
+
+    def get_spot_fee_rates(self) -> SpotFeeRates:
+        """Read the account's BTC-USDT SPOT fee schedule, without estimating slippage."""
+        rows = self._get(self._TRADE_FEE, {"instType": "SPOT", "instId": "BTC-USDT"})
+        if len(rows) != 1:
+            raise DemoError("Demo API вернул некорректные ставки комиссий")
+        row = rows[0]
+        return SpotFeeRates(_signed_rate(row.get("maker"), "maker"),
+                            _signed_rate(row.get("taker"), "taker"))
 
     def check_account(self) -> DemoSummary:
         btc, usdt = self.get_balances()
