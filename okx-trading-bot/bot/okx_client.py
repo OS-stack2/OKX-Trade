@@ -51,9 +51,12 @@ class OkxClient:
             try:
                 payload = self._transport(url, self.config.timeout_seconds)
             except HTTPError as exc:
-                if exc.code != 429 and not 500 <= exc.code <= 599:
-                    raise OkxTransportError(f"OKX HTTP error {exc.code}") from exc
-                problem = f"OKX HTTP error {exc.code}"
+                status = exc.code
+                # urlopen raises before its context manager can close an error response.
+                exc.close()
+                if status != 429 and not 500 <= status <= 599:
+                    raise OkxTransportError(f"OKX HTTP error {status}") from exc
+                problem = f"OKX HTTP error {status}"
             except (URLError, TimeoutError, ConnectionError, HTTPException) as exc:
                 problem = f"OKX network error: {exc.reason if isinstance(exc, URLError) else type(exc).__name__}"
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:

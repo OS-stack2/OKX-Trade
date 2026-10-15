@@ -17,6 +17,7 @@ class Candle:
     high: Decimal
     low: Decimal
     close: Decimal
+    confirmed: bool
 
     @property
     def closed_at(self) -> datetime:
@@ -92,6 +93,7 @@ def get_market_snapshot(client: OkxClient) -> MarketSnapshot:
             high=_positive_decimal(row[2], "candle high"),
             low=_positive_decimal(row[3], "candle low"),
             close=_positive_decimal(row[4], "candle close"),
+            confirmed=True,
         )
         if candle.high < max(candle.open, candle.close, candle.low) or candle.low > min(
             candle.open, candle.close, candle.high

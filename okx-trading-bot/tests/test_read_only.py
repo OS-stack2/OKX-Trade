@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -65,7 +65,17 @@ class ReadOnlyTests(unittest.TestCase):
         client = OkxClient(Config(), transport=response_for)
         snapshot = get_market_snapshot(client)
         self.assertEqual(len(snapshot.candles), 100)
+        self.assertTrue(all(candle.confirmed for candle in snapshot.candles))
         self.assertEqual(snapshot.latest_closed_candle.opened_at, datetime(2024, 1, 1, 23, 45, tzinfo=timezone.utc))
+
+    def test_cli_signal_uses_closed_api_candles(self) -> None:
+        client = OkxClient(Config(), transport=response_for)
+        output = StringIO()
+        with patch.object(main, "OkxClient", return_value=client), redirect_stdout(output):
+            result = main.main(["--signal"])
+        self.assertEqual(result, 0)
+        self.assertIn("Сигнал: HOLD", output.getvalue())
+        self.assertIn("Время закрытия свечи: 2024-01-02 00:00:00 UTC", output.getvalue())
 
     def test_insufficient_closed_candles_fails(self) -> None:
         def transport(url: str, timeout: float) -> dict:
@@ -97,18 +107,20 @@ class ReadOnlyTests(unittest.TestCase):
     def test_timeout_and_rate_limit_are_retried_with_limit(self) -> None:
         attempts = []
         delays = []
+        error_body = BytesIO(b"rate limited")
         def transport(url: str, timeout: float) -> dict:
             attempts.append(url)
             if len(attempts) == 1:
                 raise TimeoutError()
             if len(attempts) == 2:
-                raise HTTPError(url, 429, "rate limited", None, None)
+                raise HTTPError(url, 429, "rate limited", None, error_body)
             return response_for(url, timeout)
 
         client = OkxClient(Config(), transport=transport, sleeper=delays.append)
         self.assertEqual(client.get_ticker()[0]["last"], "42060.5")
         self.assertEqual(len(attempts), 3)
         self.assertEqual(delays, [0.5, 1.0])
+        self.assertTrue(error_body.closed)
 
         # A transport that raises on both attempts must stop rather than loop forever.
         def always_timeout(_url: str, _timeout: float) -> dict:
