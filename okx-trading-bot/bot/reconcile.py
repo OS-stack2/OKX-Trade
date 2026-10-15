@@ -12,26 +12,13 @@ from bot.demo_client import CurrencyBalance, DemoClient, SpotFeeRates
 from bot.dry_run import MAX_DEMO_AGE, MAX_TICKER_AGE, _fresh, _valid_balance
 from bot.journal import DecisionJournal, JournalError
 from bot.market_data import MarketSnapshot, SpotInstrument
-from bot.risk_manager import RiskManager, RiskStateError
+from bot.risk_manager import RiskManager, RiskSettings, RiskStateError
+from bot.strategy_budget import BudgetError, StrategyBudgetStore, STRATEGY_BUDGET_USDT
 
 
 class ReconcileStatus(StrEnum):
     READY = "READY"
     BLOCKED = "BLOCKED"
-
-
-@dataclass(frozen=True)
-class ConfirmedDayEvidence:
-    """Explicitly verified daily ledger; there is no automatic CLI provider yet."""
-
-    as_of_utc: datetime
-    day_start_capital_usdt: Decimal
-    realized_pnl_today_usdt: Decimal
-    unrealized_pnl_usdt: Decimal
-    bot_btc: Decimal
-    entries_today: int
-    complete_and_verified: bool
-    net_external_cash_flow_usdt: Decimal
 
 
 @dataclass(frozen=True)
@@ -57,6 +44,10 @@ class ReconcileReport:
     daily_loss_usdt: Decimal | None = None
     daily_loss_limit_usdt: Decimal | None = None
     daily_risk_remaining_usdt: Decimal | None = None
+    strategy_capital_usdt: Decimal | None = None
+    strategy_equity_usdt: Decimal | None = None
+    strategy_start_utc: datetime | None = None
+    per_trade_risk_limit_usdt: Decimal | None = None
 
 
 def _decimal(value: object, *, positive: bool = False) -> Decimal:
@@ -97,14 +88,14 @@ class DemoReconciler:
     def __init__(
         self, *, market_provider: Callable[[], MarketSnapshot], demo_client: DemoClient,
         journal: DecisionJournal, risk_manager: RiskManager,
-        day_provider: Callable[[], ConfirmedDayEvidence] | None = None,
+        budget_store: StrategyBudgetStore | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.market_provider = market_provider
         self.demo_client = demo_client
         self.journal = journal
         self.risk_manager = risk_manager
-        self.day_provider = day_provider
+        self.budget_store = budget_store
         self.clock = clock
 
     def run_once(self) -> ReconcileReport:
@@ -192,37 +183,45 @@ class DemoReconciler:
         except (RiskStateError, OSError, ValueError):
             state = None
             reasons.append("Подтверждённая дневная база Risk Manager отсутствует или недоступна")
-        try:
-            evidence = self.day_provider() if self.day_provider is not None else None
-        except Exception:
-            evidence = None
-        if (not isinstance(evidence, ConfirmedDayEvidence) or evidence.complete_and_verified is not True
-                or not _fresh(evidence.as_of_utc, self.clock(), MAX_DEMO_AGE)
-                or state is None or evidence.as_of_utc.date() != state.day_utc
-                or evidence.day_start_capital_usdt != state.start_capital_usdt
-                or type(evidence.entries_today) is not int or evidence.entries_today != state.entries_used
-                or evidence.bot_btc != 0 or "fill_count" not in values or values["fill_count"] != 0
-                or "open_order_count" not in values or values["open_order_count"] != 0):
-            reasons.append("Дневной капитал, PnL и происхождение позиции не подтверждены; риск не рассчитан")
-        else:
+
+        if self.budget_store is not None:
             try:
-                capital = _decimal(evidence.day_start_capital_usdt, positive=True)
-                realized = _decimal(evidence.realized_pnl_today_usdt)
-                unrealized = _decimal(evidence.unrealized_pnl_usdt)
-                cash_flow = _decimal(evidence.net_external_cash_flow_usdt)
-                if "portfolio_value_usdt" not in values or "fees_by_currency" not in values:
-                    raise ValueError("Неполный счёт")
-                if capital + realized + unrealized + cash_flow != values["portfolio_value_usdt"]:
-                    raise ValueError("PnL и движения средств не сходятся с оценкой BTC+USDT")
-                loss = max(Decimal(0), -realized) + max(Decimal(0), -unrealized)
-                limit = capital * self.risk_manager.settings.daily_loss_limit_pct
-                values.update(confirmed_realized_pnl_usdt=realized,
-                              confirmed_unrealized_pnl_usdt=unrealized,
-                              daily_loss_usdt=loss, daily_loss_limit_usdt=limit,
-                              daily_risk_remaining_usdt=max(Decimal(0), limit - loss))
-                if loss >= limit:
-                    reasons.append("Достигнут дневной лимит потерь")
-            except (ValueError, TypeError, InvalidOperation):
-                reasons.append("Подтверждённый PnL или дневной риск противоречивы")
+                baseline = self.budget_store.read()
+            except BudgetError:
+                baseline = None
+                reasons.append("Запись бюджета стратегии повреждена или недоступна")
+            if baseline is not None:
+                values.update(strategy_capital_usdt=baseline.strategy_capital_usdt,
+                              strategy_start_utc=baseline.confirmed_at_utc)
+                if self.risk_manager.settings != RiskSettings():
+                    reasons.append("Настройки Risk Manager отличаются от утверждённых лимитов")
+                if (baseline.strategy_capital_usdt != STRATEGY_BUDGET_USDT
+                        or "btc_total" not in values or "usdt_total" not in values
+                        or values["btc_total"] != baseline.demo_btc_total
+                        or values["btc_available"] != baseline.demo_btc_available
+                        or values["usdt_total"] != baseline.demo_usdt_total
+                        or values["usdt_available"] != baseline.demo_usdt_available):
+                    reasons.append("Баланс Demo изменился относительно подтверждённого бюджета; движение средств не объяснено")
+                if (state is None or state.start_capital_usdt != baseline.strategy_capital_usdt
+                        or state.day_utc != self.clock().date()
+                        or baseline.confirmed_at_utc > self.clock()
+                        or baseline.confirmed_at_utc.date() != state.day_utc):
+                    reasons.append("Дневная база Risk Manager не совпадает с бюджетом стратегии")
+                if (values.get("fill_count") != 0 or values.get("open_order_count") != 0
+                        or "fees_by_currency" not in values):
+                    reasons.append("Нет подтверждения отсутствия исполнений и чужих ордеров")
+                if not reasons:
+                    zero = Decimal(0)
+                    limit = baseline.strategy_capital_usdt * self.risk_manager.settings.daily_loss_limit_pct
+                    values.update(strategy_equity_usdt=baseline.strategy_capital_usdt,
+                                  confirmed_realized_pnl_usdt=zero,
+                                  confirmed_unrealized_pnl_usdt=zero,
+                                  daily_loss_usdt=zero, daily_loss_limit_usdt=limit,
+                                  daily_risk_remaining_usdt=limit,
+                                  per_trade_risk_limit_usdt=(baseline.strategy_capital_usdt
+                                                              * self.risk_manager.settings.risk_per_trade))
+                return ReconcileReport(ReconcileStatus.BLOCKED if reasons else ReconcileStatus.READY,
+                                       tuple(reasons), **values)
+        reasons.append("Дневной капитал, PnL и происхождение позиции не подтверждены; риск не рассчитан")
         return ReconcileReport(ReconcileStatus.BLOCKED if reasons else ReconcileStatus.READY,
                                tuple(reasons), **values)

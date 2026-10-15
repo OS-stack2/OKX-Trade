@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 from bot.demo_client import DemoClient, DemoCredentials
 from bot.journal import CycleDraft, CycleStatus, DecisionJournal
 from bot.market_data import MarketSnapshot, SpotInstrument
-from bot.reconcile import ConfirmedDayEvidence, DemoReconciler, ReconcileStatus
+from bot.reconcile import DemoReconciler, ReconcileStatus
 from bot.risk_manager import AccountSnapshot, RiskManager
 from config import Config, ConfigError
 import main
@@ -65,32 +65,28 @@ class ReconcileTests(unittest.TestCase):
         }[path]
         return {"code": "0", "data": data}
 
-    def confirmed(self):
-        return ConfirmedDayEvidence(NOW, Decimal("5100"), Decimal("0"),
-                                    Decimal("0"), Decimal("0"), 0, True, Decimal("0"))
-
     def initialize_day(self):
         self.manager.initialize_day(AccountSnapshot(
             NOW, NOW.date(), Decimal("5100"), Decimal("5100"), Decimal("5000"),
             Decimal("0"), Decimal("0"), 0, 0, 0,
         ), NOW)
 
-    def run_reconcile(self, *, day_provider=None, instrument=INSTRUMENT, price=Decimal("100")):
+    def run_reconcile(self, *, instrument=INSTRUMENT, price=Decimal("100")):
         return DemoReconciler(
             market_provider=lambda: MarketSnapshot(instrument, price, (), NOW),
             demo_client=self.client, journal=self.journal, risk_manager=self.manager,
-            day_provider=day_provider, clock=lambda: NOW,
+            clock=lambda: NOW,
         ).run_once()
 
-    def test_complete_explicit_evidence_is_ready_without_writing_risk_state(self):
+    def test_full_portfolio_baseline_cannot_be_mistaken_for_strategy_capital(self):
         self.initialize_day()
         before = self.manager.state_path.read_bytes()
-        report = self.run_reconcile(day_provider=self.confirmed)
-        self.assertEqual(report.status, ReconcileStatus.READY)
+        report = self.run_reconcile()
+        self.assertEqual(report.status, ReconcileStatus.BLOCKED)
         self.assertEqual(report.portfolio_value_usdt, Decimal("5100"))
         self.assertEqual((report.external_btc, report.bot_btc), (Decimal("1"), Decimal("0")))
-        self.assertEqual(report.daily_loss_limit_usdt, Decimal("102"))
-        self.assertEqual(report.daily_risk_remaining_usdt, Decimal("102"))
+        self.assertIsNone(report.confirmed_realized_pnl_usdt)
+        self.assertIsNone(report.daily_risk_remaining_usdt)
         self.assertEqual(report.fees_by_currency, (("BTC", Decimal("0")), ("USDT", Decimal("0"))))
         self.assertEqual(report.maker_fee_rate, Decimal("-0.0008"))
         self.assertEqual(self.manager.state_path.read_bytes(), before)
@@ -119,7 +115,7 @@ class ReconcileTests(unittest.TestCase):
         self.fills = [{"instType": "SPOT", "instId": "BTC-USDT", "tradeId": "t1",
                        "feeCcy": "USDT", "fee": "-0.1", "fillSz": "0.01", "fillPx": "100",
                        "side": "buy", "ts": str(int(NOW.timestamp() * 1000))}]
-        report = self.run_reconcile(day_provider=self.confirmed)
+        report = self.run_reconcile()
         self.assertEqual(report.status, ReconcileStatus.BLOCKED)
         self.assertEqual(report.fees_by_currency[1], ("USDT", Decimal("-0.1")))
         self.assertTrue(any("ордер" in reason for reason in report.reasons))
@@ -129,7 +125,7 @@ class ReconcileTests(unittest.TestCase):
     def test_other_spot_fill_and_missing_fee_block_without_guessing_pnl(self):
         self.initialize_day()
         self.fills = [{"instType": "SPOT", "instId": "SOL-USDT", "tradeId": "t1"}]
-        report = self.run_reconcile(day_provider=self.confirmed)
+        report = self.run_reconcile()
         self.assertEqual(report.status, ReconcileStatus.BLOCKED)
         self.assertIsNone(report.fees_by_currency)
         self.assertIsNone(report.daily_loss_usdt)
@@ -137,7 +133,7 @@ class ReconcileTests(unittest.TestCase):
     def test_demo_api_error_is_safe_and_does_not_fall_back(self):
         self.initialize_day()
         self.bad_endpoint = "/api/v5/account/balance"
-        report = self.run_reconcile(day_provider=self.confirmed)
+        report = self.run_reconcile()
         self.assertEqual(report.status, ReconcileStatus.BLOCKED)
         self.assertNotIn("fake-secret", repr(report))
         self.assertTrue(all(urlsplit(request.full_url).netloc == "eea.okx.com" for request in self.requests))
@@ -145,30 +141,17 @@ class ReconcileTests(unittest.TestCase):
     def test_stale_price_missing_limits_and_missing_journal_block(self):
         self.initialize_day()
         self.journal.path.unlink()
-        report = self.run_reconcile(day_provider=self.confirmed, instrument=replace(INSTRUMENT, max_market_size=None))
+        report = self.run_reconcile(instrument=replace(INSTRUMENT, max_market_size=None))
         self.assertEqual(report.status, ReconcileStatus.BLOCKED)
         self.assertTrue(any("Журнал" in reason for reason in report.reasons))
         self.assertTrue(any("ограничения" in reason for reason in report.reasons))
 
-    def test_unverified_pnl_and_wrong_baseline_block(self):
-        self.initialize_day()
-        for evidence in (replace(self.confirmed(), complete_and_verified=False),
-                         replace(self.confirmed(), day_start_capital_usdt=Decimal("5200")),
-                         replace(self.confirmed(), bot_btc=Decimal("1"))):
-            with self.subTest(evidence=evidence):
-                report = self.run_reconcile(day_provider=lambda value=evidence: value)
-                self.assertEqual(report.status, ReconcileStatus.BLOCKED)
-                self.assertIsNone(report.daily_risk_remaining_usdt)
-
     def test_risk_loss_and_lock_do_not_clear_during_reconciliation(self):
         self.initialize_day()
-        evidence = replace(self.confirmed(), realized_pnl_today_usdt=Decimal("-100"),
-                           unrealized_pnl_usdt=Decimal("-2"),
-                           net_external_cash_flow_usdt=Decimal("102"))
         before = self.manager.state_path.read_bytes()
-        report = self.run_reconcile(day_provider=lambda: evidence)
+        report = self.run_reconcile()
         self.assertEqual(report.status, ReconcileStatus.BLOCKED)
-        self.assertEqual(report.daily_loss_usdt, Decimal("102"))
+        self.assertIsNone(report.daily_loss_usdt)
         self.assertEqual(self.manager.state_path.read_bytes(), before)
 
     def test_cli_reports_blocked_without_secrets_or_risk_writes(self):
@@ -191,11 +174,11 @@ class ReconcileTests(unittest.TestCase):
     def test_missing_fill_fee_and_full_page_block(self):
         self.initialize_day()
         self.fills = [{"instType": "SPOT", "instId": "BTC-USDT", "tradeId": "t1"}]
-        report = self.run_reconcile(day_provider=self.confirmed)
+        report = self.run_reconcile()
         self.assertEqual(report.status, ReconcileStatus.BLOCKED)
         self.assertIsNone(report.fees_by_currency)
         self.fills = [{"instType": "SPOT", "instId": "BTC-USDT", "tradeId": str(i)} for i in range(100)]
-        report = self.run_reconcile(day_provider=self.confirmed)
+        report = self.run_reconcile()
         self.assertEqual(report.status, ReconcileStatus.BLOCKED)
         self.assertTrue(any("История" in reason for reason in report.reasons))
 

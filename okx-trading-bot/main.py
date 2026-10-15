@@ -12,6 +12,8 @@ from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
 from bot.risk_manager import RiskManager
 from bot.reconcile import DemoReconciler
+from bot.budget_setup import BudgetInitializer
+from bot.strategy_budget import BudgetError, CONFIRMATION_PHRASE, StrategyBudgetStore
 from bot.strategy import StrategyError, evaluate_signal
 from config import Config, ConfigError
 
@@ -24,7 +26,51 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--demo-check", action="store_true", help="Read the virtual OKX Demo account once")
     commands.add_argument("--dry-run", action="store_true", help="Record one non-executing Demo analysis cycle")
     commands.add_argument("--reconcile", action="store_true", help="Read-only Demo/Risk Manager reconciliation")
+    commands.add_argument("--budget-preview", action="store_true", help="Inspect the one-time 5000 USDT Demo allocation")
+    commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
+    parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     args = parser.parse_args(argv)
+    if args.budget_token and args.confirm_budget is None:
+        parser.error("--budget-token используется только с --confirm-budget")
+
+    if args.budget_preview or args.confirm_budget is not None:
+        try:
+            demo_client = DemoClient.from_env_file()
+        except (ConfigError, DemoError):
+            print("Бюджет: BLOCKED — локальный Demo-режим или Read-only API-ключ недоступен", file=sys.stderr)
+            return 1
+        journal = DecisionJournal()
+        initializer = BudgetInitializer(
+            market_provider=lambda: get_market_snapshot(OkxClient(demo_client.config)),
+            demo_client=demo_client, journal=journal, risk_manager=RiskManager(),
+            store=StrategyBudgetStore(journal.path),
+        )
+        if args.budget_preview:
+            preview = initializer.preview()
+            print(f"Стартовый бюджет OKX Demo BTC-USDT: {'ГОТОВ К ПОДТВЕРЖДЕНИЮ' if preview.ready_to_confirm else 'BLOCKED'}")
+            report = preview.report
+            if report.usdt_total is not None and report.btc_total is not None:
+                print(f"Виртуальный счёт: USDT {report.usdt_total} (доступно {report.usdt_available}), "
+                      f"внешний BTC {report.btc_total}")
+            print("Выделяемый капитал стратегии: 5000 USDT; внешний BTC в него не входит")
+            if preview.ready_to_confirm:
+                print("Бюджет ещё не записан. Для отдельного явного подтверждения выполните:")
+                print(f'.\\.venv\\Scripts\\python.exe main.py --confirm-budget "{CONFIRMATION_PHRASE}" '
+                      f'--budget-token {preview.token}')
+                print("Токен действителен в текущем пятиминутном окне UTC при неизменных данных Demo и журнала.")
+            else:
+                for reason in preview.reasons:
+                    print(f"Причина BLOCKED: {reason}")
+            return 0 if preview.ready_to_confirm else 1
+        try:
+            baseline = initializer.confirm(args.confirm_budget, args.budget_token or "")
+        except BudgetError as exc:
+            print(f"Бюджет: BLOCKED — {exc}", file=sys.stderr)
+            return 1
+        print("Стартовый бюджет OKX Demo BTC-USDT подтверждён один раз")
+        print(f"Капитал стратегии: {baseline.strategy_capital_usdt} USDT; внешний BTC: {baseline.demo_btc_total}")
+        print(f"Время UTC: {baseline.confirmed_at_utc:%Y-%m-%d %H:%M:%S}; ордера не отправлялись")
+        return 0
 
     if args.reconcile:
         try:
@@ -32,9 +78,11 @@ def main(argv: list[str] | None = None) -> int:
         except (ConfigError, DemoError):
             print("Сверка: BLOCKED — локальный Demo-режим или Read-only API-ключ недоступен", file=sys.stderr)
             return 1
+        journal = DecisionJournal()
         report = DemoReconciler(
             market_provider=lambda: get_market_snapshot(OkxClient(demo_client.config)),
-            demo_client=demo_client, journal=DecisionJournal(), risk_manager=RiskManager(),
+            demo_client=demo_client, journal=journal, risk_manager=RiskManager(),
+            budget_store=StrategyBudgetStore(journal.path),
         ).run_once()
         print(f"Сверка OKX Demo BTC-USDT SPOT: {report.status.value}")
         if report.btc_total is not None and report.usdt_total is not None:
@@ -44,6 +92,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Оценка BTC+USDT: {report.portfolio_value_usdt} USDT при цене BTC {report.btc_price_usdt}")
         if report.external_btc is not None:
             print(f"Внешний BTC: {report.external_btc}; учтённая позиция бота: 0 BTC; продажа запрещена")
+        if report.strategy_capital_usdt is not None:
+            print(f"Капитал стратегии: {report.strategy_capital_usdt} USDT "
+                  f"(подтверждён {report.strategy_start_utc:%Y-%m-%d %H:%M:%S} UTC); "
+                  f"текущая подтверждённая стоимость: {report.strategy_equity_usdt if report.strategy_equity_usdt is not None else 'неизвестна'}")
+            if report.per_trade_risk_limit_usdt is not None:
+                print(f"Лимит риска на сделку: {report.per_trade_risk_limit_usdt} USDT")
         if report.open_order_count is not None and report.fill_count is not None:
             print(f"Открытых SPOT-ордеров: {report.open_order_count}; исполнений в ответе: {report.fill_count}")
         if report.fees_by_currency is not None:
@@ -61,7 +115,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Дневной риск: убыток {report.daily_loss_usdt}, предел {report.daily_loss_limit_usdt}, "
                   f"остаток {report.daily_risk_remaining_usdt} USDT")
         else:
-            print("Подтверждённый PnL и дневной риск: неизвестны; дневная база не устанавливалась")
+            if report.strategy_capital_usdt is None:
+                print("Подтверждённый PnL и дневной риск: неизвестны; дневная база не устанавливалась")
+            else:
+                print("Подтверждённый PnL и дневной риск: неизвестны; бюджет записан, но сверка заблокирована")
         for reason in report.reasons:
             print(f"Причина BLOCKED: {reason}")
         return 0 if report.status.value == "READY" else 1
