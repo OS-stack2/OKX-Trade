@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 import sys
 
 from bot.demo_client import DemoClient, DemoError
@@ -26,6 +28,8 @@ from bot.telegram_alerts import TelegramAlerter
 from bot.watchdog import Watchdog, WatchdogError, WatchdogStore, watchdog_path_from_env
 from bot.health_monitor import HealthError, HealthMonitor, HealthStore, health_settings_from_env
 from bot.first_trade import FirstTradePreflight, REVIEW_PHRASE
+from bot.growth_research import ResearchConfig, ResearchError, load_candles_csv, research
+from bot.market_data import SpotInstrument
 from config import Config, ConfigError
 
 
@@ -51,10 +55,13 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--telegram-test", action="store_true", help="Send one owner alert through the local Demo Telegram configuration")
     commands.add_argument("--watchdog-once", action="store_true", help="One Demo GET observation using a separate Watchdog journal")
     commands.add_argument("--health-once", action="store_true", help="Check Watchdog observation freshness without OKX requests")
+    commands.add_argument("--growth-research", metavar="CSV", help="Offline 15m EMA strategy comparison from a local CSV")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     parser.add_argument("--sqlite-token", metavar="TOKEN", help="Fresh token from --sqlite-prepare")
     parser.add_argument("--first-demo-confirm", metavar="PHRASE", help="Explicit acknowledgement of the non-executing first Demo trade review")
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
+    for name in ("min-sz", "lot-sz", "tick-sz", "max-mkt-sz", "taker-fee", "slippage"):
+        parser.add_argument(f"--research-{name}", metavar="VALUE", help="Verified offline research assumption")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
         parser.error("--budget-token используется только с --confirm-budget")
@@ -64,6 +71,51 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--first-demo-confirm используется только с --first-demo-trade")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+
+    research_inputs = (args.research_min_sz, args.research_lot_sz, args.research_tick_sz,
+                       args.research_max_mkt_sz, args.research_taker_fee, args.research_slippage)
+    if args.growth_research is not None:
+        if any(value is None for value in research_inputs):
+            parser.error("--growth-research требует все --research-* параметры инструмента и затрат")
+        try:
+            minimum, lot, tick, maximum, fee, slippage = (Decimal(value) for value in research_inputs)
+            config = ResearchConfig(SpotInstrument("BTC-USDT", tick, lot, minimum, "live", "BTC", "USDT",
+                                                   max_market_size=maximum), fee, slippage)
+            historical_candles = load_candles_csv(Path(args.growth_research))
+            report = research(historical_candles, config)
+        except (ResearchError, InvalidOperation, OSError, ValueError):
+            print("Исследование: BLOCK — CSV или подтверждённые параметры некорректны; "
+                  "данные не записывались", file=sys.stderr)
+            return 1
+        def metric(value: Decimal | None) -> str:
+            return "N/A" if value is None else str(value.quantize(Decimal("0.01")))
+        print("OKX Demo BTC-USDT SPOT — только офлайн-исследование, торговля отключена")
+        print(f"Данные: {report.split_indices[3]} закрытых 15m свечей; "
+              f"TRAIN 0:{report.split_indices[1]}, VALIDATION {report.split_indices[1]}:{report.split_indices[2]}, "
+              f"FINAL_TEST {report.split_indices[2]}:{report.split_indices[3]}")
+        for label, first, last in (("TRAIN", 0, report.split_indices[1]),
+                                   ("VALIDATION", report.split_indices[1], report.split_indices[2]),
+                                   ("FINAL_TEST", report.split_indices[2], report.split_indices[3])):
+            print(f"{label} UTC: {historical_candles[first].opened_at.isoformat()} — "
+                  f"{historical_candles[last - 1].closed_at.isoformat()}")
+        print(f"Затраты: taker {fee}, проскальзывание {slippage}; "
+              f"minSz {minimum}, lotSz {lot}, tickSz {tick}, maxMktSz {maximum}")
+        print("Вариант | Период | Доходность % | Просадка % | Profit factor | Сделки | К Buy & Hold, п.п.")
+        for item in (*report.training, *report.validation, report.final_test):
+            print(f"{item.variant} | {item.period} | {metric(item.return_pct)} | "
+                  f"{metric(item.max_drawdown_pct)} | {metric(item.profit_factor)} | "
+                  f"{item.trades} | {metric(item.relative_buy_hold_pct)}")
+        print(f"Выбор по TRAIN/VALIDATION: {report.selected_variant}; финальный период не использовался для выбора")
+        for item in report.stresses:
+            print(f"Стресс {item.name}: доходность {metric(item.return_pct)}%; "
+                  f"просадка {metric(item.max_drawdown_pct)}%; {item.note}")
+        print(f"Рекомендация: {report.recommendation}")
+        for warning in report.warnings:
+            print(f"ПРЕДУПРЕЖДЕНИЕ: {warning}")
+        print("Исторические результаты не гарантируют рост; BUY/SELL, OKX API и рабочая SQLite не вызывались")
+        return 0
+    if any(value is not None for value in research_inputs):
+        parser.error("--research-* параметры используются только с --growth-research")
 
     if args.sqlite_prepare or args.sqlite_init is not None:
         setup = ServerSqliteSetup()
