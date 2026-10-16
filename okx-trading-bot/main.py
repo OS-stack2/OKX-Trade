@@ -28,7 +28,8 @@ from bot.telegram_alerts import TelegramAlerter
 from bot.watchdog import Watchdog, WatchdogError, WatchdogStore, watchdog_path_from_env
 from bot.health_monitor import HealthError, HealthMonitor, HealthStore, health_settings_from_env
 from bot.first_trade import FirstTradePreflight, REVIEW_PHRASE
-from bot.growth_research import ResearchConfig, ResearchError, ResearchReport, load_candles_csv, research
+from bot.growth_research import (ResearchConfig, ResearchError, ResearchReport,
+                                 load_candles_csv, okx_taker_debit_rate, research)
 from bot.history_download import HistoryError, RESEARCH_BARS, download_history, save_history_csv
 from bot.market_data import Candle, SpotInstrument
 from config import Config, ConfigError
@@ -46,7 +47,8 @@ def _print_research_report(report: ResearchReport, historical_candles: tuple[Can
         print(f"{label} UTC: {historical_candles[first].opened_at.isoformat()} — "
               f"{historical_candles[last - 1].closed_at.isoformat()}")
     print(f"Затраты (допущение): taker {fee}, проскальзывание {slippage}; "
-          f"minSz {minimum}, lotSz {lot}, tickSz {tick}, maxMktSz {maximum}")
+          f"minSz {minimum} BTC, lotSz {lot} BTC, tickSz {tick} USDT, "
+          f"maxMktSz {maximum} USDT стоимости рыночного BUY")
     print("Вариант | Период | Доходность % | Просадка % | Profit factor | Сделки | К Buy & Hold, п.п.")
     for item in (*report.training, *report.validation, report.final_test):
         print(f"{item.variant} | {item.period} | {metric(item.return_pct)} | "
@@ -94,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     for name in ("min-sz", "lot-sz", "tick-sz", "max-mkt-sz", "taker-fee", "slippage"):
         parser.add_argument(f"--research-{name}", metavar="VALUE", help="Verified offline research assumption")
+    parser.add_argument("--research-okx-taker-rate", metavar="SIGNED_RATE",
+                        help="Signed OKX taker rate; negative debit becomes positive research cost")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
         parser.error("--budget-token используется только с --confirm-budget")
@@ -132,24 +136,30 @@ def main(argv: list[str] | None = None) -> int:
 
     research_limits = (args.research_min_sz, args.research_lot_sz, args.research_tick_sz,
                        args.research_max_mkt_sz)
-    research_inputs = (*research_limits, args.research_taker_fee, args.research_slippage)
+    research_inputs = (*research_limits, args.research_taker_fee,
+                       args.research_slippage, args.research_okx_taker_rate)
     if args.growth_research is not None:
         if any(value is None for value in research_limits):
             parser.error("--growth-research требует проверенные --research-* ограничения инструмента")
-        if (args.research_taker_fee is None) != (args.research_slippage is None):
-            parser.error("Укажите обе оценки затрат или не указывайте ни одну для сценарного анализа")
+        if args.research_taker_fee is not None and args.research_okx_taker_rate is not None:
+            parser.error("Выберите одну форму taker-ставки: положительную стоимость или подписанную OKX")
+        if ((args.research_taker_fee is not None or args.research_okx_taker_rate is not None)
+                != (args.research_slippage is not None)):
+            parser.error("Укажите taker-ставку и проскальзывание вместе либо используйте сценарный анализ")
         try:
             minimum, lot, tick, maximum = (Decimal(value) for value in research_limits)
             instrument = SpotInstrument("BTC-USDT", tick, lot, minimum, "live", "BTC", "USDT",
                                         max_market_size=maximum)
             historical_candles = load_candles_csv(Path(args.growth_research))
-            if args.research_taker_fee is None:
+            if args.research_taker_fee is None and args.research_okx_taker_rate is None:
                 scenarios = (("СЦЕНАРИЙ НИЗКИХ ЗАТРАТ", Decimal("0.0005"), Decimal("0.0005")),
                              ("СЦЕНАРИЙ БАЗОВЫХ ЗАТРАТ", Decimal("0.001"), Decimal("0.001")),
                              ("СЦЕНАРИЙ ВЫСОКИХ ЗАТРАТ", Decimal("0.002"), Decimal("0.003")))
             else:
+                fee = (okx_taker_debit_rate(Decimal(args.research_okx_taker_rate))
+                       if args.research_okx_taker_rate is not None else Decimal(args.research_taker_fee))
                 scenarios = (("ЗАТРАТЫ ПОЛЬЗОВАТЕЛЯ (НЕ ПРОВЕРЕНЫ OKX)",
-                              Decimal(args.research_taker_fee), Decimal(args.research_slippage)),)
+                              fee, Decimal(args.research_slippage)),)
             reports = [(label, fee, slip, research(historical_candles, ResearchConfig(instrument, fee, slip)))
                        for label, fee, slip in scenarios]
         except (ResearchError, InvalidOperation, OSError, ValueError):

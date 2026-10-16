@@ -28,6 +28,18 @@ class ResearchError(ValueError):
     """Historical data or offline assumptions are invalid."""
 
 
+def okx_taker_debit_rate(signed_rate: Decimal) -> Decimal:
+    """Convert OKX's negative fee debit to the model's positive cost fraction.
+
+    A positive OKX rate can represent a rebate, which this cost-only model does
+    not support. Reject it instead of silently treating a rebate as a fee.
+    """
+    if (not isinstance(signed_rate, Decimal) or not signed_rate.is_finite()
+            or not -1 < signed_rate <= 0):
+        raise ResearchError("OKX taker rate must be a non-positive finite debit")
+    return -signed_rate
+
+
 @dataclass(frozen=True)
 class ResearchConfig:
     instrument: SpotInstrument
@@ -48,8 +60,8 @@ class ResearchConfig:
                       instrument.max_market_size, self.initial_usdt, self.max_position_usdt):
             if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
                 raise ResearchError("Ограничение инструмента или капитала неизвестно")
-        if instrument.max_market_size < instrument.min_size:
-            raise ResearchError("maxMktSz меньше minSz")
+        # maxMktSz caps the quote-currency cost of a SPOT market BUY; minSz is
+        # a base-currency quantity. Their bare numbers cannot be compared.
         for value in (self.taker_fee_rate, self.slippage_rate, self.max_position_fraction):
             if not isinstance(value, Decimal) or not value.is_finite() or value < 0 or value >= 1:
                 raise ResearchError("Комиссия, проскальзывание или доля позиции некорректны")
@@ -223,7 +235,8 @@ def _floor(value: Decimal, step: Decimal) -> Decimal:
 
 def _buy_hold(candles: tuple[Candle, ...], start: int, end: int, config: ResearchConfig) -> Decimal | None:
     entry = candles[start + 1].open * (ONE + config.slippage_rate)
-    quantity = _floor(config.initial_usdt / (entry * (ONE + config.taker_fee_rate)),
+    quantity = _floor(min(config.initial_usdt / (entry * (ONE + config.taker_fee_rate)),
+                          config.instrument.max_market_size / entry),
                       config.instrument.lot_size)
     if quantity < config.instrument.min_size:
         return None
@@ -300,7 +313,8 @@ def run_backtest(candles: tuple[Candle, ...], start: int, end: int, variant: str
                 if risk_per_btc > 0 and planned_stop > 0 and planned_take > entry and risk_budget > 0:
                     raw = min(risk_budget / risk_per_btc, cash / (entry * (ONE + fee)),
                               cash * config.max_position_fraction / entry,
-                              config.max_position_usdt / entry, config.instrument.max_market_size)
+                              config.max_position_usdt / entry,
+                              config.instrument.max_market_size / entry)
                     planned = _floor(raw, config.instrument.lot_size)
                     if planned < config.instrument.min_size:
                         skipped += 1

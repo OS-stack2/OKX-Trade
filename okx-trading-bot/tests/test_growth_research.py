@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal as D
 from io import StringIO
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 import urllib.request
@@ -14,7 +15,7 @@ from unittest.mock import patch
 import main
 from bot.growth_research import (
     ResearchConfig, ResearchError, VARIANTS, _indicators, _signal_at,
-    load_candles_csv, research, run_backtest, validate_candles,
+    load_candles_csv, okx_taker_debit_rate, research, run_backtest, validate_candles,
 )
 from bot.market_data import Candle, SpotInstrument
 from bot.risk_manager import RiskSettings
@@ -31,7 +32,7 @@ def candles_for(closes):
 
 def config(*, fee="0.001", slip="0.001", min_size="0.0001", max_position="5000"):
     instrument = SpotInstrument("BTC-USDT", D("0.01"), D("0.0001"), D(min_size),
-                                "live", "BTC", "USDT", max_market_size=D("1000"))
+                                "live", "BTC", "USDT", max_market_size=D("1000000"))
     return ResearchConfig(instrument, D(fee), D(slip), max_position_usdt=D(max_position))
 
 
@@ -114,7 +115,34 @@ class GrowthResearchTests(unittest.TestCase):
         restricted = replace(config(), instrument=replace(config().instrument, max_market_size=D("0.5")))
         with patch("bot.growth_research._signal_at", side_effect=lambda i, *_: "BUY" if i == 60 else "HOLD"):
             max_size = run_backtest(candles, 0, 120, "EMA_9_21", restricted)
-        self.assertLessEqual(max_size.entry_quantities[0], D("0.5"))
+        self.assertLessEqual(max_size.max_entry_notional_usdt, D("0.5"))
+
+    def test_spot_market_buy_cap_is_quote_notional_and_buy_hold_obeys_it(self):
+        candles = candles_for([100] * 119 + [200])
+        restricted = replace(config(fee="0", slip="0"),
+                             instrument=replace(config().instrument, max_market_size=D("20")))
+        with patch("bot.growth_research._signal_at", side_effect=lambda i, *_: "BUY" if i == 60 else "HOLD"):
+            result = run_backtest(candles, 0, 120, "EMA_9_21", restricted)
+        self.assertEqual(result.entry_quantities, (D("0.2"),))
+        self.assertEqual(result.max_entry_notional_usdt, D("20"))
+        self.assertLessEqual(result.buy_hold_return_pct, D("0.4"))
+        # Different units: this is a valid 0.01 USDT cap, despite minSz=0.1 BTC.
+        mixed_units = replace(config(), instrument=replace(config().instrument,
+                              min_size=D("0.1"), max_market_size=D("0.01")))
+        mixed_units.validate()
+
+    def test_negative_okx_taker_rate_is_positive_model_cost_and_rebates_block(self):
+        self.assertEqual(okx_taker_debit_rate(D("-0.001")), D("0.001"))
+        self.assertEqual(okx_taker_debit_rate(D("0")), D("0"))
+        for value in (D("0.0001"), D("NaN"), D("-1")):
+            with self.subTest(value=value), self.assertRaises(ResearchError):
+                okx_taker_debit_rate(value)
+        candles = candles_for([100] * 120)
+        with patch("bot.growth_research._signal_at", side_effect=lambda i, *_: "BUY" if i == 60 else "HOLD"):
+            free = run_backtest(candles, 0, 120, "EMA_9_21", config(fee="0", slip="0"))
+            charged = run_backtest(candles, 0, 120, "EMA_9_21",
+                                   config(fee=str(okx_taker_debit_rate(D("-0.001"))), slip="0"))
+        self.assertLess(charged.return_pct, free.return_pct)
 
     def test_research_rejects_changed_risk_settings_and_multiple_positions(self):
         with self.assertRaises(ResearchError):
@@ -204,6 +232,7 @@ class GrowthResearchTests(unittest.TestCase):
             output = StringIO()
             with (patch.object(main.DemoClient, "from_env_file", side_effect=AssertionError("OKX called")),
                   patch.object(main, "DecisionJournal", side_effect=AssertionError("SQLite called")),
+                  patch.object(sqlite3, "connect", side_effect=AssertionError("SQLite opened")),
                   patch.object(urllib.request, "urlopen", side_effect=AssertionError("HTTP called")),
                   redirect_stdout(output)):
                 code = main.main(["--growth-research", str(path), "--research-min-sz", "0.0001",
@@ -215,6 +244,22 @@ class GrowthResearchTests(unittest.TestCase):
             self.assertIn("FINAL_TEST UTC:", output.getvalue())
             self.assertIn("ПРЕДУПРЕЖДЕНИЕ", output.getvalue())
             self.assertIn("торговля отключена", output.getvalue())
+
+    def test_cli_accepts_signed_okx_debit_without_touching_sqlite(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "candles.csv"
+            path.write_text("opened_at,open,high,low,close,confirm\n" + "".join(
+                f"{c.opened_at.isoformat()},{c.open},{c.high},{c.low},{c.close},1\n"
+                for c in candles_for([100] * 120)), encoding="utf-8")
+            output = StringIO()
+            with patch.object(sqlite3, "connect", side_effect=AssertionError("SQLite opened")), redirect_stdout(output):
+                result = main.main(["--growth-research", str(path), "--research-min-sz", "0.00001",
+                                    "--research-lot-sz", "0.00000001", "--research-tick-sz", "0.1",
+                                    "--research-max-mkt-sz", "1000000",
+                                    "--research-okx-taker-rate=-0.001", "--research-slippage", "0.001"])
+            self.assertEqual(result, 0)
+            self.assertIn("taker 0.001", output.getvalue())
+            self.assertIn("maxMktSz 1000000 USDT", output.getvalue())
 
 
 if __name__ == "__main__":
