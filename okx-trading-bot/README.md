@@ -577,3 +577,12 @@ sudo systemctl daemon-reload && sudo systemctl enable --now okx-demo-trend.timer
 ```
 
 В `.env`: `OKX_TREND_ENABLED=1`, `OKX_TREND_STATE_PATH=/var/lib/okx-watchdog/trend_trader.sqlite3`.
+
+## Сводки Demo-теста (этап 5.2)
+
+`--demo-report` собирает по журналам обоих ботов (и одной публичной цене BTC) сводку: сделки, PnL, причины выходов, капитал тренд-бота и его количество BTC против удержания с первой сделки — и отправляет её в Telegram. `okx-demo-report.timer` запускает её по понедельникам в 09:00 UTC. `okx-demo-final.timer` однократно 2026-12-16 09:00 UTC отправляет итог двухмесячного теста (`--demo-report-final`); боты после этого продолжают работать, пока их не выключат.
+
+```bash
+sudo install -o root -g root -m 644 deploy/systemd/okx-demo-report.* deploy/systemd/okx-demo-final.* /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now okx-demo-report.timer okx-demo-final.timer
+```

@@ -38,6 +38,7 @@ from bot.demo_trader import (DemoTradeClient, DemoTrader, TraderError, TraderSet
 from bot.trend_trader import (TrendSettings, TrendStore, TrendTrader, read_daily_closes,
                               resume as trend_resume, trend_state_path_from_env)
 from bot.market_data import read_spot_instrument
+from bot.demo_report import build_report
 from config import Config, ConfigError
 import sqlite3
 
@@ -199,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--demo-trade-once", action="store_true", help="One Demo trading cycle: reconcile, signal, trade")
     commands.add_argument("--demo-trade-status", action="store_true", help="Show the Demo trader journal without OKX requests")
     commands.add_argument("--demo-trade-resume", metavar="PHRASE", help="Clear a Demo trader HALT after manual review")
+    commands.add_argument("--demo-report", action="store_true", help="Weekly summary of both Demo bots to Telegram")
+    commands.add_argument("--demo-report-final", action="store_true", help="Final 2-month Demo test summary to Telegram")
     commands.add_argument("--trend-once", action="store_true", help="One daily Demo trend-allocator cycle")
     commands.add_argument("--trend-status", action="store_true", help="Show the Demo trend-allocator book")
     commands.add_argument("--trend-resume", metavar="PHRASE", help="Clear a trend-allocator HALT after manual review")
@@ -406,6 +409,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Telegram: {report.notification}")
         print("Свежесть GET не подтверждает защиту позиции; торговля отключена")
         return report.exit_code
+
+    if args.demo_report or args.demo_report_final:
+        try:
+            try:
+                budget = TrendSettings.from_env_file().budget_usdt
+            except ConfigError:
+                budget = TrendSettings().budget_usdt
+            try:
+                price = get_public_quote_evidence(OkxClient(Config.from_environment())).last_price
+            except (ConfigError, OkxError, OSError):
+                price = None
+            text = build_report(trader=TraderStore(trader_state_path_from_env()),
+                                trend=TrendStore(trend_state_path_from_env()), trend_budget=budget,
+                                price=price, now=datetime.now(timezone.utc), final=args.demo_report_final)
+        except (OSError, sqlite3.Error, TraderError) as exc:
+            print(f"Сводка: BLOCK — {exc}", file=sys.stderr)
+            return 1
+        print(text)
+        alerter = TelegramAlerter.from_env_file()
+        sent = alerter is not None and alerter.send_text(text)
+        print("Telegram: " + ("отправлено" if sent else "не отправлено"))
+        return 0 if sent else 1
 
     if args.trend_once or args.trend_status or args.trend_resume is not None:
         return _trend_command(args)
