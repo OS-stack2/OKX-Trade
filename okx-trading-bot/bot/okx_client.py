@@ -45,7 +45,7 @@ class OkxClient:
         self._transport = transport or _http_get_json
         self._sleep = sleeper
 
-    def _get(self, path: str, params: dict[str, str]) -> list[Any]:
+    def _get(self, path: str, params: dict[str, str], *, allow_empty: bool = False) -> list[Any]:
         url = f"{self.config.base_url}{path}?{urlencode(params)}"
         for attempt in range(self.config.max_attempts):
             try:
@@ -67,7 +67,7 @@ class OkxClient:
                 code = payload["code"]
                 if code == "0":
                     data = payload.get("data")
-                    if not isinstance(data, list) or not data:
+                    if not isinstance(data, list) or (not data and not allow_empty):
                         raise OkxResponseError("OKX response has no data list")
                     return data
                 if code != "50011":
@@ -84,6 +84,17 @@ class OkxClient:
             "/api/v5/market/candles",
             {"instId": "BTC-USDT", "bar": "15m", "limit": str(limit)},
         )
+
+    def get_history_candles(self, *, after: int | None = None, limit: int = 100) -> list[Any]:
+        """Public GET; OKX `after` pages toward older candle timestamps."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("history-candles limit must be 1..100")
+        if after is not None and (not isinstance(after, int) or isinstance(after, bool) or after <= 0):
+            raise ValueError("history-candles cursor must be a positive millisecond timestamp")
+        params = {"instId": "BTC-USDT", "bar": "15m", "limit": str(limit)}
+        if after is not None:
+            params["after"] = str(after)
+        return self._get("/api/v5/market/history-candles", params, allow_empty=True)
 
     def get_ticker(self) -> list[Any]:
         return self._get("/api/v5/market/ticker", {"instId": "BTC-USDT"})

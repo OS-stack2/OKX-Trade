@@ -28,9 +28,37 @@ from bot.telegram_alerts import TelegramAlerter
 from bot.watchdog import Watchdog, WatchdogError, WatchdogStore, watchdog_path_from_env
 from bot.health_monitor import HealthError, HealthMonitor, HealthStore, health_settings_from_env
 from bot.first_trade import FirstTradePreflight, REVIEW_PHRASE
-from bot.growth_research import ResearchConfig, ResearchError, load_candles_csv, research
-from bot.market_data import SpotInstrument
+from bot.growth_research import ResearchConfig, ResearchError, ResearchReport, load_candles_csv, research
+from bot.history_download import HistoryError, RESEARCH_BARS, download_history, save_history_csv
+from bot.market_data import Candle, SpotInstrument
 from config import Config, ConfigError
+
+
+def _print_research_report(report: ResearchReport, historical_candles: tuple[Candle, ...],
+                           minimum: Decimal, lot: Decimal, tick: Decimal, maximum: Decimal,
+                           fee: Decimal, slippage: Decimal, metric) -> None:
+    print(f"Данные: {report.split_indices[3]} закрытых 15m свечей; "
+          f"TRAIN 0:{report.split_indices[1]}, VALIDATION {report.split_indices[1]}:{report.split_indices[2]}, "
+          f"FINAL_TEST {report.split_indices[2]}:{report.split_indices[3]}")
+    for label, first, last in (("TRAIN", 0, report.split_indices[1]),
+                               ("VALIDATION", report.split_indices[1], report.split_indices[2]),
+                               ("FINAL_TEST", report.split_indices[2], report.split_indices[3])):
+        print(f"{label} UTC: {historical_candles[first].opened_at.isoformat()} — "
+              f"{historical_candles[last - 1].closed_at.isoformat()}")
+    print(f"Затраты (допущение): taker {fee}, проскальзывание {slippage}; "
+          f"minSz {minimum}, lotSz {lot}, tickSz {tick}, maxMktSz {maximum}")
+    print("Вариант | Период | Доходность % | Просадка % | Profit factor | Сделки | К Buy & Hold, п.п.")
+    for item in (*report.training, *report.validation, report.final_test):
+        print(f"{item.variant} | {item.period} | {metric(item.return_pct)} | "
+              f"{metric(item.max_drawdown_pct)} | {metric(item.profit_factor)} | "
+              f"{item.trades} | {metric(item.relative_buy_hold_pct)}")
+    print(f"Выбор по TRAIN/VALIDATION: {report.selected_variant}; финальный период не использовался для выбора")
+    for item in report.stresses:
+        print(f"Стресс {item.name}: доходность {metric(item.return_pct)}%; "
+              f"просадка {metric(item.max_drawdown_pct)}%; {item.note}")
+    print(f"Рекомендация: {report.recommendation}")
+    for warning in report.warnings:
+        print(f"ПРЕДУПРЕЖДЕНИЕ: {warning}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,6 +84,10 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--watchdog-once", action="store_true", help="One Demo GET observation using a separate Watchdog journal")
     commands.add_argument("--health-once", action="store_true", help="Check Watchdog observation freshness without OKX requests")
     commands.add_argument("--growth-research", metavar="CSV", help="Offline 15m EMA strategy comparison from a local CSV")
+    commands.add_argument("--download-history", action="store_true", help="Public GET-only BTC-USDT 15m history to CSV")
+    parser.add_argument("--history-bars", type=int, default=RESEARCH_BARS, metavar="COUNT", help="Closed candles to download (default 17280)")
+    parser.add_argument("--history-output", type=Path, default=Path("data/btc_usdt_15m.csv"), metavar="CSV")
+    parser.add_argument("--overwrite-history", action="store_true", help="Explicitly replace an existing history CSV")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     parser.add_argument("--sqlite-token", metavar="TOKEN", help="Fresh token from --sqlite-prepare")
     parser.add_argument("--first-demo-confirm", metavar="PHRASE", help="Explicit acknowledgement of the non-executing first Demo trade review")
@@ -71,47 +103,67 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--first-demo-confirm используется только с --first-demo-trade")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+    if not args.download_history and (args.history_bars != RESEARCH_BARS or
+                                      args.history_output != Path("data/btc_usdt_15m.csv") or args.overwrite_history):
+        parser.error("--history-* и --overwrite-history используются только с --download-history")
 
-    research_inputs = (args.research_min_sz, args.research_lot_sz, args.research_tick_sz,
-                       args.research_max_mkt_sz, args.research_taker_fee, args.research_slippage)
-    if args.growth_research is not None:
-        if any(value is None for value in research_inputs):
-            parser.error("--growth-research требует все --research-* параметры инструмента и затрат")
+    if args.download_history:
+        if args.history_output.exists() and not args.overwrite_history:
+            print("История: BLOCK — CSV уже существует; требуется явный --overwrite-history", file=sys.stderr)
+            return 1
         try:
-            minimum, lot, tick, maximum, fee, slippage = (Decimal(value) for value in research_inputs)
-            config = ResearchConfig(SpotInstrument("BTC-USDT", tick, lot, minimum, "live", "BTC", "USDT",
-                                                   max_market_size=maximum), fee, slippage)
+            report = download_history(OkxClient(Config.from_environment()), bars=args.history_bars)
+            save_history_csv(report, args.history_output, overwrite=args.overwrite_history)
+        except (ConfigError, OkxError, HistoryError, OSError, ValueError):
+            print("История: BLOCK — API, ряд свечей или путь CSV не прошли проверку; "
+                  "существующий файл не изменён", file=sys.stderr)
+            return 1
+        train, validation, final = report.split_counts
+        print(f"OKX BTC-USDT SPOT 15m: {len(report.candles)} подтверждённых свечей; "
+              f"{report.candles[0].opened_at.isoformat()} — {report.candles[-1].closed_at.isoformat()}")
+        print(f"CSV: {args.history_output}; TRAIN {train}, VALIDATION {validation}, FINAL_TEST {final}")
+        print("Достаточность истории: " + ("ДОСТАТОЧНО ПО ДЛИНЕ" if report.sufficient else "НЕДОСТАТОЧНО"))
+        print(f"Причина: {report.reason}")
+        print("Комиссии и проскальзывание из публичных свечей неизвестны; "
+              "исследование без их подтверждения требует сценарного анализа")
+        print(f"Исследование: ./.venv/bin/python main.py --growth-research {args.history_output} "
+              "--research-min-sz ... --research-lot-sz ... --research-tick-sz ... --research-max-mkt-sz ...")
+        return 0 if report.sufficient else 1
+
+    research_limits = (args.research_min_sz, args.research_lot_sz, args.research_tick_sz,
+                       args.research_max_mkt_sz)
+    research_inputs = (*research_limits, args.research_taker_fee, args.research_slippage)
+    if args.growth_research is not None:
+        if any(value is None for value in research_limits):
+            parser.error("--growth-research требует проверенные --research-* ограничения инструмента")
+        if (args.research_taker_fee is None) != (args.research_slippage is None):
+            parser.error("Укажите обе оценки затрат или не указывайте ни одну для сценарного анализа")
+        try:
+            minimum, lot, tick, maximum = (Decimal(value) for value in research_limits)
+            instrument = SpotInstrument("BTC-USDT", tick, lot, minimum, "live", "BTC", "USDT",
+                                        max_market_size=maximum)
             historical_candles = load_candles_csv(Path(args.growth_research))
-            report = research(historical_candles, config)
+            if args.research_taker_fee is None:
+                scenarios = (("СЦЕНАРИЙ НИЗКИХ ЗАТРАТ", Decimal("0.0005"), Decimal("0.0005")),
+                             ("СЦЕНАРИЙ БАЗОВЫХ ЗАТРАТ", Decimal("0.001"), Decimal("0.001")),
+                             ("СЦЕНАРИЙ ВЫСОКИХ ЗАТРАТ", Decimal("0.002"), Decimal("0.003")))
+            else:
+                scenarios = (("ЗАТРАТЫ ПОЛЬЗОВАТЕЛЯ (НЕ ПРОВЕРЕНЫ OKX)",
+                              Decimal(args.research_taker_fee), Decimal(args.research_slippage)),)
+            reports = [(label, fee, slip, research(historical_candles, ResearchConfig(instrument, fee, slip)))
+                       for label, fee, slip in scenarios]
         except (ResearchError, InvalidOperation, OSError, ValueError):
-            print("Исследование: BLOCK — CSV или подтверждённые параметры некорректны; "
+            print("Исследование: BLOCK — CSV или параметры некорректны; "
                   "данные не записывались", file=sys.stderr)
             return 1
         def metric(value: Decimal | None) -> str:
             return "N/A" if value is None else str(value.quantize(Decimal("0.01")))
         print("OKX Demo BTC-USDT SPOT — только офлайн-исследование, торговля отключена")
-        print(f"Данные: {report.split_indices[3]} закрытых 15m свечей; "
-              f"TRAIN 0:{report.split_indices[1]}, VALIDATION {report.split_indices[1]}:{report.split_indices[2]}, "
-              f"FINAL_TEST {report.split_indices[2]}:{report.split_indices[3]}")
-        for label, first, last in (("TRAIN", 0, report.split_indices[1]),
-                                   ("VALIDATION", report.split_indices[1], report.split_indices[2]),
-                                   ("FINAL_TEST", report.split_indices[2], report.split_indices[3])):
-            print(f"{label} UTC: {historical_candles[first].opened_at.isoformat()} — "
-                  f"{historical_candles[last - 1].closed_at.isoformat()}")
-        print(f"Затраты: taker {fee}, проскальзывание {slippage}; "
-              f"minSz {minimum}, lotSz {lot}, tickSz {tick}, maxMktSz {maximum}")
-        print("Вариант | Период | Доходность % | Просадка % | Profit factor | Сделки | К Buy & Hold, п.п.")
-        for item in (*report.training, *report.validation, report.final_test):
-            print(f"{item.variant} | {item.period} | {metric(item.return_pct)} | "
-                  f"{metric(item.max_drawdown_pct)} | {metric(item.profit_factor)} | "
-                  f"{item.trades} | {metric(item.relative_buy_hold_pct)}")
-        print(f"Выбор по TRAIN/VALIDATION: {report.selected_variant}; финальный период не использовался для выбора")
-        for item in report.stresses:
-            print(f"Стресс {item.name}: доходность {metric(item.return_pct)}%; "
-                  f"просадка {metric(item.max_drawdown_pct)}%; {item.note}")
-        print(f"Рекомендация: {report.recommendation}")
-        for warning in report.warnings:
-            print(f"ПРЕДУПРЕЖДЕНИЕ: {warning}")
+        print("ПРЕДУПРЕЖДЕНИЕ: публичные свечи не подтверждают комиссию аккаунта или проскальзывание; "
+              "все затраты ниже — сценарные/введённые пользователем допущения")
+        for label, fee, slippage, report in reports:
+            print(f"\n{label}: taker {fee}, проскальзывание {slippage}")
+            _print_research_report(report, historical_candles, minimum, lot, tick, maximum, fee, slippage, metric)
         print("Исторические результаты не гарантируют рост; BUY/SELL, OKX API и рабочая SQLite не вызывались")
         return 0
     if any(value is not None for value in research_inputs):
