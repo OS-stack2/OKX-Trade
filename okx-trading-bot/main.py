@@ -22,6 +22,7 @@ from bot.strategy_budget import BudgetError, CONFIRMATION_PHRASE, StrategyBudget
 from bot.strategy import StrategyError, evaluate_signal
 from bot.telegram_alerts import TelegramAlerter
 from bot.watchdog import Watchdog, WatchdogError, WatchdogStore, watchdog_path_from_env
+from bot.health_monitor import HealthError, HealthMonitor, HealthStore, health_settings_from_env
 from config import Config, ConfigError
 
 
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--recovery-check", action="store_true", help="Read-only Demo GET recovery and durable emergency halt")
     commands.add_argument("--telegram-test", action="store_true", help="Send one owner alert through the local Demo Telegram configuration")
     commands.add_argument("--watchdog-once", action="store_true", help="One Demo GET observation using a separate Watchdog journal")
+    commands.add_argument("--health-once", action="store_true", help="Check Watchdog observation freshness without OKX requests")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     args = parser.parse_args(argv)
@@ -49,6 +51,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--budget-token используется только с --confirm-budget")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+
+    if args.health_once:
+        try:
+            report = HealthMonitor(HealthStore(health_settings_from_env())).run_once()
+        except (HealthError, OSError):
+            print("Health Monitor: UNKNOWN — локальная конфигурация недоступна", file=sys.stderr)
+            return 1
+        print(f"OKX Demo Watchdog Health: {report.status}")
+        print(f"Последний успешный GET: {report.last_success_utc.isoformat() if report.last_success_utc else 'неизвестен'}")
+        print(f"Причина: {report.reason}")
+        if report.notification:
+            print(f"Telegram: {report.notification}")
+        print("Свежесть GET не подтверждает защиту позиции; торговля отключена")
+        return report.exit_code
 
     if args.watchdog_once:
         try:

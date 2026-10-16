@@ -1,0 +1,11 @@
+[Unit]
+Description=Check OKX Demo Watchdog freshness every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:2/5:00
+Persistent=true
+AccuracySec=30s
+Unit=okx-health.service
+
+[Install]
+WantedBy=timers.target

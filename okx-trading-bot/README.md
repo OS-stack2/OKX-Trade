@@ -296,3 +296,43 @@ EMA начинается со среднего арифметического п
 Unit работает под непривилегированным пользователем, с `UMask=0077`, приватным `StateDirectory` (`0700`), правами файла SQLite `0600`, read-only кодом, лимитами памяти/CPU/задач/времени и ограничением частоты записей в systemd journal. Он не меняет firewall, DNS, SSH или другие службы. Нужен исходящий HTTPS к региональному домену OKX и Telegram; при недоступности региона другой домен автоматически не выбирается. Помимо Telegram `sendMessage`, Watchdog использует только GET; торговых POST, BUY/SELL и переводов нет.
 
 Существующий бюджет 5 000 виртуальных USDT, риск 0,5%/2%, стоп 1%, тейк 2% и база UTC не менялись. Торговых POST, переводов, LIVE и продажи внешнего BTC нет.
+
+## Health Monitor для установленного Ubuntu Watchdog (этап 4B.2B-2H)
+
+`python main.py --health-once` делает один **офлайн**-цикл: читает отдельный `watchdog.sqlite3` через SQLite `mode=ro`, проверяет последний успешный GET и завершает процесс. Запросов к OKX нет. Порог просрочки по умолчанию — **15 минут**; при необходимости укажите в локальном `.env` `OKX_HEALTH_STALE_MINUTES=15` (целое число 1–1440). Нужны существующие `OKX_MODE=DEMO` и `OKX_WATCHDOG_STATE_PATH=/var/lib/okx-watchdog/watchdog.sqlite3`. Собственное состояние и дедупликация сохраняются **рядом**, в `/var/lib/okx-watchdog/health.sqlite3` с правами `0600`. Рабочая торговая SQLite не читается и не меняется.
+
+`HEALTHY` означает лишь свежий успешный GET Watchdog; это **не** подтверждение принадлежности BTC, SL или права на торговлю. `STALE` — успешный GET старше порога либо пропущены запуски. `API_UNAVAILABLE` — последний записанный цикл Watchdog завершился ошибкой GET, даже если предыдущий GET свежий. `UNKNOWN` — данных нет, SQLite/время противоречивы, часы переведены назад или конфигурация недоступна. Только `HEALTHY` возвращает код `0`; остальные состояния — `1`. Telegram извещает о просрочке, ошибке API и восстановлении **после нового успешного GET**. Попытка фиксируется до отправки, поэтому неоднозначный таймаут не повторяется после перезапуска. Ошибка Telegram не откатывает состояние. При ошибке собственной SQLite результат — `UNKNOWN` без отправки. Единственный возможный POST — Telegram `sendMessage`, не OKX. `HALTED`, риск и бюджет монитор не открывает.
+
+На **уже работающем** Ubuntu 24.04 Watchdog установите лишь **новые** unit-файлы. Сначала обновите установленный код до этого коммита и проверьте, что прежний `--watchdog-once` работает. Если `git status --short` показывает отслеживаемые изменения, остановитесь и разберите их до `pull`. Существующие `okx-watchdog.service`/`.timer`, `.env`, SQLite и другие службы не перезаписывайте. Права существующего `.env` должны оставаться `0600`, владелец `okx-watchdog`; секреты не передавайте в аргументах команд. Новую службу эти команды ещё не включают:
+
+```bash
+sudo git -C /opt/okx-watchdog status --short
+sudo git -C /opt/okx-watchdog pull --ff-only origin main
+cd /opt/okx-watchdog/okx-trading-bot
+./.venv/bin/python -m unittest discover -s tests -q
+sudo test ! -e /etc/systemd/system/okx-health.service
+sudo test ! -e /etc/systemd/system/okx-health.timer
+sudo install -o root -g root -m 644 deploy/systemd/okx-health.service /etc/systemd/system/okx-health.service
+sudo install -o root -g root -m 644 deploy/systemd/okx-health.timer /etc/systemd/system/okx-health.timer
+sudo systemd-analyze verify /etc/systemd/system/okx-health.service /etc/systemd/system/okx-health.timer
+sudo systemctl daemon-reload
+sudo systemctl start okx-health.service
+sudo journalctl -u okx-health.service -n 30 --no-pager
+```
+
+`systemctl start` может вернуть ошибку при `STALE`/`API_UNAVAILABLE`/`UNKNOWN`; посмотрите причину в журнале и проверьте системное UTC-время. Когда результат понятен, **явно** включите только новый таймер:
+
+```bash
+sudo systemctl enable --now okx-health.timer
+systemctl list-timers --all okx-health.timer
+```
+
+Новый таймер запускается раз в пять минут, на две минуты позже Watchdog, под тем же непривилегированным пользователем. Service ограничивает запись файлов, память, CPU, время и объём сообщений в journal. Установка файлов сама по себе не включает таймер. Для отката отключите **только** новый таймер и удалите **только** новые unit-файлы; `health.sqlite3` сохраните для разбора истории:
+
+```bash
+sudo systemctl disable --now okx-health.timer
+sudo rm /etc/systemd/system/okx-health.timer /etc/systemd/system/okx-health.service
+sudo systemctl daemon-reload
+```
+
+Монитор на **том же сервере** не сможет сообщить о полном отключении сервера или интернета. Для этого нужен внешний наблюдатель с отдельным каналом связи. При сетевом сбое Telegram тоже может не доставить сообщение; после восстановления проверяйте systemd journal.

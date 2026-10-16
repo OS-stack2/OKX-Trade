@@ -66,6 +66,9 @@ class TelegramAlerter:
             "WATCHDOG_RESTORED": "OKX Watchdog Demo BTC-USDT: связь с публичным и Demo GET восстановлена. Принадлежность BTC и защита всё ещё неизвестны.",
             "WATCHDOG_CHANGED": "OKX Watchdog Demo BTC-USDT: баланс или список ордеров изменился. Проверьте виртуальный счёт вручную; защита не подтверждена.",
             "WATCHDOG_SUSPICIOUS": "OKX Watchdog Demo BTC-USDT: обнаружено подозрительное расхождение баланса или ордеров. Проверьте виртуальный счёт вручную; защита не подтверждена.",
+            "HEALTH_STALE": "OKX Health Monitor: последнее успешное наблюдение Watchdog просрочено. Проверьте таймер и журнал; состояние Demo-счёта неизвестно.",
+            "HEALTH_API_UNAVAILABLE": "OKX Health Monitor: последний цикл Watchdog сообщил об ошибке GET. Проверьте OKX и журнал; состояние Demo-счёта неизвестно.",
+            "HEALTH_RESTORED": "OKX Health Monitor: новое успешное наблюдение Watchdog получено. Принадлежность BTC и защита не подтверждены; торговля отключена.",
         }
         if event not in messages:
             return False

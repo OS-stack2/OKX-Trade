@@ -1,0 +1,29 @@
+[Unit]
+Description=OKX Demo Watchdog observation health (no trading)
+After=okx-watchdog.service
+
+[Service]
+Type=oneshot
+User=okx-watchdog
+Group=okx-watchdog
+WorkingDirectory=/opt/okx-watchdog/okx-trading-bot
+ExecStart=/opt/okx-watchdog/okx-trading-bot/.venv/bin/python /opt/okx-watchdog/okx-trading-bot/main.py --health-once
+UMask=0077
+StateDirectory=okx-watchdog
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/okx-watchdog
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=64M
+CPUQuota=20%
+TasksMax=8
+TimeoutStartSec=30s
+LogRateLimitIntervalSec=1h
+LogRateLimitBurst=40
