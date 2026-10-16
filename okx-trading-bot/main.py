@@ -8,6 +8,7 @@ import sys
 from bot.demo_client import DemoClient, DemoError
 from bot.dry_run import DryRunOrchestrator
 from bot.execution_engine import ExecutionEngine
+from bot.execution_diagnostics import inspect_execution
 from bot.journal import DecisionJournal, JournalError
 from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
@@ -38,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--budget-preview", action="store_true", help="Inspect the one-time 5000 USDT Demo allocation")
     commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
     commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
+    commands.add_argument("--execution-diagnose", action="store_true", help="Read-only explanation of SQLite and protection blocks")
     commands.add_argument("--order-preview", action="store_true", help="Read-only, blocked Demo LIMIT BUY preview")
     commands.add_argument("--first-demo-trade", action="store_true", help="One controlled Demo trade preflight; execution remains blocked")
     commands.add_argument("--protection-capabilities", action="store_true", help="GET-only Demo attached TP/SL capability inventory")
@@ -209,6 +211,37 @@ def main(argv: list[str] | None = None) -> int:
                   f"BTC после комиссии: {intent.owned_btc}")
         print("Команда не подключается к OKX, не разрешает отправку и не создаёт ордера")
         return 1 if report.blocked else 0
+
+    if args.execution_diagnose:
+        report = inspect_execution(ExecutionEngine())
+        print(f"OKX Demo BTC-USDT SPOT — диагностика исполнения: BLOCK")
+        print(f"SQLite: {report.sqlite_status}; причина: {report.sqlite_reason}")
+        if report.halted is None:
+            print("HALTED: неизвестно")
+        else:
+            print(f"HALTED: {'да' if report.halted else 'нет'}")
+        if report.halted:
+            print(f"Причина HALTED: {report.halt_reason_code}; записано: "
+                  f"{report.halt_updated_at_utc.isoformat()}")
+        print(f"Намерений в SQLite: {report.intent_count}")
+        intent = report.latest_intent
+        if intent is None:
+            print("Последнее намерение: отсутствует или недоступно")
+        else:
+            print(f"Последнее намерение: {intent.client_order_id}; состояние {intent.state.value}; "
+                  f"причина {intent.reason_code}")
+            print(f"Свеча: {intent.candle_closed_at.isoformat()}; создано: "
+                  f"{intent.created_at_utc.isoformat()}; обновлено: {intent.updated_at_utc.isoformat()}")
+            print(f"BUY: план {intent.quantity} BTC; локально учтено {intent.filled_quantity} BTC; "
+                  f"BTC после комиссии {intent.owned_btc}; биржевой ID "
+                  f"{'сохранён' if intent.exchange_order_id_known else 'не сохранён'}")
+            for flag in intent.flags:
+                print(f"Локальный блокирующий признак: {flag}")
+        print(f"Защита частичных BUY: {report.protection_status} (отдельная блокировка)")
+        for missing in report.missing_protection_evidence:
+            print(f"Нет доказательства: {missing}")
+        print("SQLite только прочитана; OKX не вызывался; HALTED не снят; ордера не отправлены")
+        return 1
 
     if args.protection_capabilities:
         try:
