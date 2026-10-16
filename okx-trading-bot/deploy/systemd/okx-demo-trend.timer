@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the OKX Demo trend allocator hourly (it trades at most once per UTC day)
+
+[Timer]
+OnCalendar=*-*-* *:07:00
+Persistent=true
+AccuracySec=30s
+Unit=okx-demo-trend.service
+
+[Install]
+WantedBy=timers.target

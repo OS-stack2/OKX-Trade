@@ -35,6 +35,9 @@ from bot.history_download import HistoryError, RESEARCH_BARS, download_history, 
 from bot.market_data import Candle, SpotInstrument
 from bot.demo_trader import (DemoTradeClient, DemoTrader, TraderError, TraderSettings, TraderStore,
                              abandon_position, resume, trader_state_path_from_env)
+from bot.trend_trader import (TrendSettings, TrendStore, TrendTrader, read_daily_closes,
+                              resume as trend_resume, trend_state_path_from_env)
+from bot.market_data import read_spot_instrument
 from config import Config, ConfigError
 import sqlite3
 
@@ -122,6 +125,52 @@ def _demo_trader_command(args: argparse.Namespace) -> int:
     return report.exit_code
 
 
+def _trend_command(args: argparse.Namespace) -> int:
+    try:
+        store = TrendStore(trend_state_path_from_env())
+        if args.trend_resume is not None:
+            if trend_resume(store, args.trend_resume):
+                print("Тренд-бот: HALT снят")
+                return 0
+            print("Тренд-бот: неверная фраза", file=sys.stderr)
+            return 1
+        if args.trend_status:
+            try:
+                budget = TrendSettings.from_env_file().budget_usdt
+            except ConfigError:
+                budget = TrendSettings().budget_usdt
+            book = store.book(budget)
+            print(f"Тренд-бот: {'HALTED ' + book.halted if book.halted else 'работает'}")
+            print(f"Книга: {book.usdt:.2f} USDT + {book.btc} BTC (стартовый бюджет {budget} USDT)")
+            print(f"Последний обработанный день: {book.last_day or 'нет'}")
+            for row in store.trades()[-10:]:
+                print(f"  {row['day']} {row['side']} {row['btc']} BTC @ {row['price']}, "
+                      f"цель {Decimal(row['target']) * 100:.0f}%, капитал {Decimal(row['equity']):.2f}")
+            return 1 if book.halted else 0
+        settings = TrendSettings.from_env_file()
+        client = DemoTradeClient.from_env_file()
+        public = OkxClient(client.config)
+        alerter = TelegramAlerter.from_env_file()
+        def price() -> Decimal:
+            snapshot = get_public_quote_evidence(public)
+            if snapshot.last_price is None:
+                raise OkxError("ticker unavailable")
+            return snapshot.last_price
+        trader = TrendTrader(client=client, store=store, settings=settings,
+                             closes_provider=lambda: read_daily_closes(public),
+                             instrument_provider=lambda: read_spot_instrument(public),
+                             price_provider=price,
+                             notifier=alerter.send_text if alerter is not None else None)
+        report = trader.run_once()
+    except (ConfigError, OkxError, OSError, sqlite3.Error) as exc:
+        print(f"Тренд-бот: BLOCK — {exc}", file=sys.stderr)
+        return 1
+    print(f"OKX Demo тренд-бот BTC: {report.status}")
+    for line in report.lines:
+        print(line)
+    return report.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only OKX BTC-USDT market data and EMA signal")
     commands = parser.add_mutually_exclusive_group(required=True)
@@ -150,6 +199,9 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--demo-trade-once", action="store_true", help="One Demo trading cycle: reconcile, signal, trade")
     commands.add_argument("--demo-trade-status", action="store_true", help="Show the Demo trader journal without OKX requests")
     commands.add_argument("--demo-trade-resume", metavar="PHRASE", help="Clear a Demo trader HALT after manual review")
+    commands.add_argument("--trend-once", action="store_true", help="One daily Demo trend-allocator cycle")
+    commands.add_argument("--trend-status", action="store_true", help="Show the Demo trend-allocator book")
+    commands.add_argument("--trend-resume", metavar="PHRASE", help="Clear a trend-allocator HALT after manual review")
     commands.add_argument("--demo-trade-abandon", metavar="PHRASE", help="Stop tracking a position closed manually on OKX")
     parser.add_argument("--history-bars", type=int, default=RESEARCH_BARS, metavar="COUNT", help="Closed candles to download (default 17280)")
     parser.add_argument("--history-output", type=Path, default=Path("data/btc_usdt_15m.csv"), metavar="CSV")
@@ -354,6 +406,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Telegram: {report.notification}")
         print("Свежесть GET не подтверждает защиту позиции; торговля отключена")
         return report.exit_code
+
+    if args.trend_once or args.trend_status or args.trend_resume is not None:
+        return _trend_command(args)
 
     if args.demo_trade_once or args.demo_trade_status or args.demo_trade_resume is not None \
             or args.demo_trade_abandon is not None:

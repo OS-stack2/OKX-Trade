@@ -96,6 +96,12 @@ class OkxClient:
             params["after"] = str(after)
         return self._get("/api/v5/market/history-candles", params, allow_empty=True)
 
+    def get_daily_candles(self, limit: int = 100) -> list[Any]:
+        """UTC-aligned daily candles (newest first, the first one may be unconfirmed)."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 300:
+            raise ValueError("daily candles limit must be 1..300")
+        return self._get("/api/v5/market/candles", {"instId": "BTC-USDT", "bar": "1Dutc", "limit": str(limit)})
+
     def get_ticker(self) -> list[Any]:
         return self._get("/api/v5/market/ticker", {"instId": "BTC-USDT"})
 
