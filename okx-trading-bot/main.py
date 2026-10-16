@@ -20,6 +20,7 @@ from bot.reconcile import DemoReconciler
 from bot.budget_setup import BudgetInitializer
 from bot.strategy_budget import BudgetError, CONFIRMATION_PHRASE, StrategyBudgetStore
 from bot.strategy import StrategyError, evaluate_signal
+from bot.telegram_alerts import TelegramAlerter
 from config import Config, ConfigError
 
 
@@ -38,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--protection-capabilities", action="store_true", help="GET-only Demo attached TP/SL capability inventory")
     commands.add_argument("--protection-simulate", action="store_true", help="Offline BUY/SL/TP lifecycle scenarios in temporary SQLite")
     commands.add_argument("--recovery-check", action="store_true", help="Read-only Demo GET recovery and durable emergency halt")
+    commands.add_argument("--telegram-test", action="store_true", help="Send one owner alert through the local Demo Telegram configuration")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     args = parser.parse_args(argv)
@@ -45,6 +47,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--budget-token используется только с --confirm-budget")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+
+    if args.telegram_test:
+        try:
+            alerter = TelegramAlerter.from_env_file()
+            delivered = alerter is not None and alerter.notify("TEST")
+        except Exception:
+            delivered = False
+        if delivered:
+            print("Telegram: тестовое сообщение отправлено; торговля отключена")
+            return 0
+        print("Telegram: тестовое сообщение не доставлено; проверьте локальный .env и доступ к чату", file=sys.stderr)
+        return 1
 
     if args.recovery_check:
         report = RecoveryManager(engine=ExecutionEngine()).check_once()

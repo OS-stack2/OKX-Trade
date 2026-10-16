@@ -10,10 +10,14 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
+from threading import Lock
 from typing import Callable
 from urllib.request import Request, urlopen
 
 from config import ConfigError, _read_env_file
+
+
+TEST_MESSAGE = "OKX Demo — тест аварийного уведомления. Торговля отключена"
 
 
 def _post(request: Request, timeout: float) -> object:
@@ -26,6 +30,8 @@ class TelegramAlerter:
     token: str = field(repr=False)
     chat_id: str = field(repr=False)
     transport: Callable[[Request, float], object] = field(default=_post, repr=False)
+    _test_lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
+    _test_attempted: bool = field(default=False, init=False, repr=False, compare=False)
 
     @classmethod
     def from_env_file(cls, path: Path | None = None) -> TelegramAlerter | None:
@@ -50,6 +56,7 @@ class TelegramAlerter:
 
     def notify(self, event: str) -> bool:
         messages = {
+            "TEST": TEST_MESSAGE,
             "HALTED": "OKX Demo BTC-USDT: аварийная остановка сохранена. Новые сделки запрещены. Проверьте --recovery-check.",
             "UNPROTECTED": "OKX Demo BTC-USDT: BTC бота без подтверждённого SL. HALTED сохранён. Требуется ручная проверка Demo-счёта.",
             "MISMATCH": "OKX Demo BTC-USDT: данные биржи и SQLite расходятся. HALTED сохранён. Требуется ручная сверка.",
@@ -58,12 +65,20 @@ class TelegramAlerter:
         }
         if event not in messages:
             return False
-        body = json.dumps({"chat_id": self.chat_id, "text": messages[event]}, ensure_ascii=False).encode("utf-8")
-        request = Request(
-            f"https://api.telegram.org/bot{self.token}/sendMessage", data=body,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
+        if event == "TEST":
+            # Claim the attempt before transport so a timeout cannot trigger a
+            # second send through this instance (even from another thread).
+            with self._test_lock:
+                if self._test_attempted:
+                    return False
+                object.__setattr__(self, "_test_attempted", True)
         try:
+            body = json.dumps({"chat_id": self.chat_id, "text": messages[event]},
+                              ensure_ascii=False).encode("utf-8")
+            request = Request(
+                f"https://api.telegram.org/bot{self.token}/sendMessage", data=body,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
             response = self.transport(request, 5.0)
             return isinstance(response, dict) and response.get("ok") is True
         except Exception:

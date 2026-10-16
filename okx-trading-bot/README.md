@@ -226,3 +226,19 @@ EMA начинается со среднего арифметического п
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe main.py --execution-check
 ```
+
+## Проверка Telegram без торговли (этап 4B.2B-2F)
+
+В локальном `.env` установите `OKX_MODE=DEMO`, `OKX_TELEGRAM_BOT_TOKEN` и `OKX_TELEGRAM_CHAT_ID`. Значения возьмите из собственного Telegram-бота и нужного чата; не публикуйте их. Ключи OKX для этой команды не нужны. Затем из папки `okx-trading-bot` в Windows PowerShell выполните:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --telegram-test
+```
+
+Команда **один раз** отправляет в указанный Telegram-чат ровно: «OKX Demo — тест аварийного уведомления. Торговля отключена». Повторная попытка на том же объекте отправителя запрещена даже после тайм-аута, чтобы неоднозначный ответ не породил дубликат. Для новой явной проверки запустите команду заново. При успешном ответе Telegram код выхода `0`, при отсутствии настроек или ошибке доставки — `1` с общим сообщением без токена и Chat ID. Доставку после сетевого тайм-аута подтвердите в Telegram вручную.
+
+`--telegram-test` обращается только к Telegram `sendMessage`: OKX API, рабочая SQLite, бюджет, Risk Manager и `HALTED` не читаются и не меняются. Торговых запросов нет. Офлайн-тесты используют вымышленные значения и подменённый транспорт; один тест проверяет на временной SQLite, что `HALTED` уже записан и переживает отказ Telegram:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
