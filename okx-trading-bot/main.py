@@ -23,6 +23,7 @@ from bot.strategy import StrategyError, evaluate_signal
 from bot.telegram_alerts import TelegramAlerter
 from bot.watchdog import Watchdog, WatchdogError, WatchdogStore, watchdog_path_from_env
 from bot.health_monitor import HealthError, HealthMonitor, HealthStore, health_settings_from_env
+from bot.first_trade import FirstTradePreflight, REVIEW_PHRASE
 from config import Config, ConfigError
 
 
@@ -38,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
     commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
     commands.add_argument("--order-preview", action="store_true", help="Read-only, blocked Demo LIMIT BUY preview")
+    commands.add_argument("--first-demo-trade", action="store_true", help="One controlled Demo trade preflight; execution remains blocked")
     commands.add_argument("--protection-capabilities", action="store_true", help="GET-only Demo attached TP/SL capability inventory")
     commands.add_argument("--protection-simulate", action="store_true", help="Offline BUY/SL/TP lifecycle scenarios in temporary SQLite")
     commands.add_argument("--recovery-check", action="store_true", help="Read-only Demo GET recovery and durable emergency halt")
@@ -45,12 +47,60 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--watchdog-once", action="store_true", help="One Demo GET observation using a separate Watchdog journal")
     commands.add_argument("--health-once", action="store_true", help="Check Watchdog observation freshness without OKX requests")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
+    parser.add_argument("--first-demo-confirm", metavar="PHRASE", help="Explicit acknowledgement of the non-executing first Demo trade review")
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
         parser.error("--budget-token используется только с --confirm-budget")
+    if args.first_demo_confirm is not None and not args.first_demo_trade:
+        parser.error("--first-demo-confirm используется только с --first-demo-trade")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+
+    if args.first_demo_trade:
+        if args.first_demo_confirm is not None and args.first_demo_confirm != REVIEW_PHRASE:
+            print("Первая Demo-сделка: BLOCK — фраза ручного просмотра неверна; запросы не выполнялись", file=sys.stderr)
+            return 1
+        try:
+            demo_client = DemoClient.from_env_file()
+            journal = DecisionJournal()
+            risk_manager = RiskManager()
+            budget_store = StrategyBudgetStore(journal.path)
+            engine = ExecutionEngine(journal=journal, risk_manager=risk_manager,
+                                     budget_store=budget_store)
+            report = FirstTradePreflight(
+                demo_client=demo_client, engine=engine,
+                market_provider=lambda: get_market_snapshot(OkxClient(demo_client.config)),
+                reconciliation_provider=lambda market: DemoReconciler(
+                    market_provider=lambda: market, demo_client=demo_client,
+                    journal=journal, risk_manager=risk_manager,
+                    budget_store=budget_store).run_once(),
+            ).run_once(confirmation=args.first_demo_confirm)
+        except Exception:
+            print("Первая Demo-сделка: BLOCK — данные или локальное состояние недоступны", file=sys.stderr)
+            return 1
+        print(f"Первая OKX Demo BTC-USDT SPOT сделка: {report.status}; торговые POST отключены")
+        print(f"Ручной просмотр: {'подтверждён' if report.manual_review_confirmed else 'не подтверждён'}")
+        if report.signal is not None:
+            signal = report.signal
+            print(f"EMA: {signal.signal.value}; EMA9 {signal.ema9}; EMA21 {signal.ema21}; "
+                  f"закрытая свеча {signal.candle_closed_at:%Y-%m-%d %H:%M:%S} UTC")
+        if report.reconciliation is not None:
+            recon = report.reconciliation
+            print(f"Demo-сверка: {recon.status.value}; стратегия 5000 USDT; "
+                  f"доступно USDT {recon.usdt_available if recon.usdt_available is not None else 'неизвестно'}; "
+                  f"внешний BTC {recon.external_btc if recon.external_btc is not None else 'неизвестен'} — продажа запрещена")
+        if report.preview is not None and report.preview.quantity_btc is not None:
+            preview = report.preview
+            print(f"Гипотетический BUY: {preview.quantity_btc} BTC; вход {preview.estimated_entry_usdt}; "
+                  f"SL {preview.estimated_stop_usdt}; TP {preview.estimated_take_usdt}; "
+                  f"риск {preview.estimated_risk_usdt} USDT")
+        for stage, result in report.stages:
+            print(f"Этап {stage}: {result}")
+        for reason in report.reasons:
+            print(f"Причина BLOCK: {reason}")
+        print("Ни BUY, ни SL/TP, ни SELL не отправлены; рабочая SQLite и риск не изменялись")
+        return report.exit_code
 
     if args.health_once:
         try:
@@ -140,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
             for price, loss in result.price_losses_usdt:
                 estimate = "неизвестен" if loss is None else f"{loss} USDT"
                 print(f"При условной цене {price} USDT возможный убыток: {estimate}")
+            if result.simulated_realized_pnl_usdt is not None:
+                print(f"Учебный PnL полностью закрытой позиции: {result.simulated_realized_pnl_usdt} USDT")
             for reason in result.reasons:
                 print(f"Причина BLOCK/HALTED: {reason}")
         print("Потери — условная оценка выхода по заданным ценам, не верхняя граница риска.")

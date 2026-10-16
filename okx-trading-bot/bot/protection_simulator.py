@@ -150,6 +150,7 @@ class SimulationResult:
     take_usdt: Decimal
     price_losses_usdt: tuple[tuple[Decimal, Decimal | None], ...]
     event_count: int
+    simulated_realized_pnl_usdt: Decimal | None = None
 
 
 @dataclass
@@ -387,13 +388,18 @@ class SimulationLedger:
                 _apply(state, event, self.config)
             except (KeyError, TypeError, ValueError, InvalidOperation, ArithmeticError) as exc:
                 raise SimulationError("Временный журнал симуляции повреждён; BLOCK") from exc
+        # Only a fully closed, internally consistent synthetic position has a
+        # realized result. Partial/ambiguous exits cannot invent a final PnL.
+        realized = (state.sale_proceeds_usdt - state.buy_cost_usdt
+                    if state.gross_bought > 0 and state.remaining == 0
+                    and not state.exposure_unknown else None)
         return SimulationResult(state.buy_state, "BLOCK", state.halted,
             tuple(state.reasons), state.owned, state.remaining, self.config.external_btc,
             state.reserved_btc, state.uncovered,
             None if state.exposure_unknown else state.unprotected_seconds,
             None if state.exposure_unknown else state.btc_seconds_unprotected,
             self.config.stop_usdt, self.config.take_usdt,
-            tuple(state.price_losses), len(rows))
+            tuple(state.price_losses), len(rows), realized)
 
 
 def parse_price_path(raw: str) -> tuple[Decimal, ...]:
@@ -431,6 +437,17 @@ def run_sample_scenarios(prices: tuple[Decimal, ...]) -> tuple[tuple[str, Simula
               stop_size_btc=net_full, take_size_btc=net_full,
               stop_price_usdt=c.stop_usdt, take_price_usdt=c.take_usdt,
               stop_id="stop-1", take_id="take-1", group_id="oco-1", exclusive_oco=True))),
+        ("Полный учебный цикл BUY, защита, закрытие TP и PnL", (
+            e("ack", 0, "BUY_ACK"),
+            e("fill", 1, "BUY_FILL", quantity_btc=full, price_usdt=c.entry_usdt,
+              fee_btc=fee_full, order_id="fill-1"),
+            e("oco", 1, "PROTECTION_ACK", quantity_btc=net_full,
+              stop_size_btc=net_full, take_size_btc=net_full,
+              stop_price_usdt=c.stop_usdt, take_price_usdt=c.take_usdt,
+              stop_id="stop-1", take_id="take-1", group_id="oco-1", exclusive_oco=True),
+            e("exit", 30, "PROTECTION_FILL", quantity_btc=net_full,
+              price_usdt=c.take_usdt,
+              fee_usdt=-(net_full * c.take_usdt * c.exit_fee_rate), order_id="take-1"))),
         ("Частичный BUY: SL задержан, затем новая часть без SL", (
             e("ack", 0, "BUY_ACK"),
             e("fill-a", 1, "BUY_FILL", quantity_btc=half, price_usdt=c.entry_usdt,
