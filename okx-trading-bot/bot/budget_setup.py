@@ -12,7 +12,7 @@ from pathlib import Path
 
 from bot.demo_client import DemoClient
 from bot.journal import DecisionJournal, JournalError
-from bot.market_data import MarketSnapshot
+from bot.market_data import MarketSnapshot, PublicQuoteEvidence
 from bot.reconcile import DemoReconciler, ReconcileReport
 from bot.risk_manager import AccountSnapshot, RiskManager, RiskSettings, RiskStateError
 from bot.strategy_budget import (
@@ -38,7 +38,7 @@ class BudgetPreview:
 
 class BudgetInitializer:
     def __init__(
-        self, *, market_provider: Callable[[], MarketSnapshot], demo_client: DemoClient,
+        self, *, market_provider: Callable[[], MarketSnapshot | PublicQuoteEvidence], demo_client: DemoClient,
         journal: DecisionJournal, risk_manager: RiskManager, store: StrategyBudgetStore,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
@@ -94,9 +94,14 @@ class BudgetInitializer:
             reasons.append("Недостаточно свободного Demo USDT или есть неизвестный резерв")
         if report.open_order_count != 0 or report.fill_count != 0 or report.fees_by_currency is None:
             reasons.append("Открытые ордера или история исполнений не позволяют подтвердить чистый старт")
-        if report.instrument is None or report.btc_price_usdt is None or report.taker_fee_rate is None:
-            reasons.append("Цена, комиссия или ограничения BTC-USDT неизвестны")
-        else:
+        if report.btc_price_usdt is None:
+            reasons.append("PRICE: подтверждённая свежая цена BTC-USDT отсутствует")
+        if report.instrument is None:
+            reasons.append("LIMITS: подтверждённые ограничения BTC-USDT отсутствуют")
+        if report.taker_fee_rate is None:
+            reasons.append("FEES: подтверждённая taker-ставка Demo отсутствует")
+        if (report.instrument is not None and report.btc_price_usdt is not None
+                and report.taker_fee_rate is not None):
             try:
                 instrument = report.instrument
                 minimum = (instrument.min_size / instrument.lot_size).to_integral_value(rounding=ROUND_CEILING) * instrument.lot_size

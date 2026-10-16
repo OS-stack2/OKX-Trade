@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import StringIO
@@ -17,7 +18,7 @@ import main
 from bot.budget_setup import BudgetInitializer
 from bot.demo_client import DemoClient, DemoCredentials
 from bot.journal import CycleDraft, CycleStatus, DecisionJournal
-from bot.market_data import MarketSnapshot, SpotInstrument
+from bot.market_data import MarketSnapshot, PublicQuoteEvidence, SpotInstrument
 from bot.reconcile import DemoReconciler, ReconcileStatus
 from bot.risk_manager import RiskManager, RiskSettings
 from bot.strategy_budget import BudgetError, CONFIRMATION_PHRASE, StrategyBudgetStore
@@ -185,6 +186,25 @@ class BudgetTests(unittest.TestCase):
         self.assertFalse(self.initializer().preview().ready_to_confirm)
         self.assertFalse(self.manager.state_path.exists())
 
+    def test_preview_separates_stale_price_and_missing_limit_without_writes(self):
+        before = self.journal.path.read_bytes()
+        evidence = PublicQuoteEvidence(
+            replace(INSTRUMENT, max_market_size=None), self.price,
+            NOW - timedelta(seconds=61), (),
+        )
+        preview = BudgetInitializer(
+            market_provider=lambda: evidence, demo_client=self.client, journal=self.journal,
+            risk_manager=self.manager, store=self.store, clock=lambda: NOW,
+        ).preview()
+        self.assertFalse(preview.ready_to_confirm)
+        self.assertEqual(dict(preview.report.diagnostic_checks)["QUOTE_TIME"], "BLOCKED")
+        self.assertEqual(dict(preview.report.diagnostic_checks)["LIMITS"], "BLOCKED")
+        self.assertTrue(any("котировка старше" in x for x in preview.reasons))
+        self.assertTrue(any("maxMktSz" in x for x in preview.reasons))
+        self.assertEqual(self.journal.path.read_bytes(), before)
+        self.assertIsNone(self.store.read())
+        self.assertFalse(self.manager.state_path.exists())
+
     def test_token_rechecks_changes_and_expires_at_utc_window(self):
         preview = self.initializer().preview()
         self.usdt_total = self.usdt_available = "5001"
@@ -248,7 +268,7 @@ class BudgetTests(unittest.TestCase):
         with patch.object(main.DemoClient, "from_env_file", return_value=self.client), \
              patch.object(main, "DecisionJournal", return_value=self.journal), \
              patch.object(main, "RiskManager", return_value=self.manager), \
-             patch.object(main, "get_market_snapshot", return_value=self.market()), \
+             patch.object(main, "get_public_quote_evidence", return_value=self.market()), \
              patch.object(main, "OkxClient"), \
              patch.object(main, "BudgetInitializer", side_effect=factory), \
              redirect_stdout(output), redirect_stderr(error):
@@ -267,7 +287,7 @@ class BudgetTests(unittest.TestCase):
         with patch.object(main.DemoClient, "from_env_file", return_value=self.client), \
              patch.object(main, "DecisionJournal", return_value=self.journal), \
              patch.object(main, "RiskManager", return_value=self.manager), \
-             patch.object(main, "get_market_snapshot", return_value=self.market()), \
+             patch.object(main, "get_public_quote_evidence", return_value=self.market()), \
              patch.object(main, "OkxClient"), \
              patch.object(main, "DemoReconciler", side_effect=lambda **kwargs: DemoReconciler(**kwargs, clock=lambda: NOW)), \
              redirect_stdout(output):

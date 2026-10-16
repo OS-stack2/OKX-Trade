@@ -146,6 +146,29 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(any("Журнал" in reason for reason in report.reasons))
         self.assertTrue(any("ограничения" in reason for reason in report.reasons))
 
+    def test_quote_fee_and_risk_failures_have_distinct_safe_diagnostics(self):
+        self.bad_endpoint = "/api/v5/account/trade-fee"
+        report = DemoReconciler(
+            market_provider=lambda: MarketSnapshot(
+                replace(INSTRUMENT, max_market_size=None), Decimal("100"), (),
+                NOW - timedelta(seconds=61)),
+            demo_client=self.client, journal=self.journal, risk_manager=self.manager,
+            clock=lambda: NOW,
+        ).run_once()
+        checks = dict(report.diagnostic_checks)
+        self.assertEqual(checks["PRICE"], "OK")
+        self.assertEqual(checks["QUOTE_TIME"], "BLOCKED")
+        self.assertEqual(checks["INSTRUMENT"], "OK")
+        self.assertEqual(checks["LIMITS"], "BLOCKED")
+        self.assertEqual(checks["FEES"], "BLOCKED")
+        self.assertEqual(checks["RISK_STATE"], "UNINITIALIZED")
+        self.assertTrue(any("maxMktSz" in reason for reason in report.reasons))
+        self.assertTrue(any("котировка старше" in reason for reason in report.reasons))
+        self.assertNotIn("fake-secret", " ".join(report.reasons))
+        self.assertIsNone(report.btc_price_usdt)
+        self.assertIsNone(report.portfolio_value_usdt)
+        self.assertFalse(self.manager.state_path.exists())
+
     def test_risk_loss_and_lock_do_not_clear_during_reconciliation(self):
         self.initialize_day()
         before = self.manager.state_path.read_bytes()
@@ -159,7 +182,7 @@ class ReconcileTests(unittest.TestCase):
         with patch.object(main.DemoClient, "from_env_file", return_value=self.client), \
              patch.object(main, "DecisionJournal", return_value=self.journal), \
              patch.object(main, "RiskManager", return_value=self.manager), \
-             patch.object(main, "get_market_snapshot", return_value=MarketSnapshot(INSTRUMENT, Decimal("100"), (), NOW)), \
+             patch.object(main, "get_public_quote_evidence", return_value=MarketSnapshot(INSTRUMENT, Decimal("100"), (), NOW)), \
              patch.object(main, "OkxClient"), redirect_stdout(output), \
              patch.object(main, "DemoReconciler", side_effect=lambda **kwargs: DemoReconciler(**kwargs, clock=lambda: NOW)):
             self.assertEqual(main.main(["--reconcile"]), 1)

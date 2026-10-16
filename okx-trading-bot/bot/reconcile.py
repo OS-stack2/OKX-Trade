@@ -11,7 +11,8 @@ from enum import StrEnum
 from bot.demo_client import CurrencyBalance, DemoClient, SpotFeeRates
 from bot.dry_run import MAX_DEMO_AGE, MAX_TICKER_AGE, _fresh, _valid_balance
 from bot.journal import DecisionJournal, JournalError
-from bot.market_data import MarketSnapshot, SpotInstrument
+from bot.market_data import (MarketSnapshot, PublicQuoteEvidence, SpotInstrument,
+                             assess_public_quote)
 from bot.risk_manager import RiskManager, RiskSettings, RiskStateError
 from bot.strategy_budget import BudgetError, StrategyBudgetStore, STRATEGY_BUDGET_USDT
 
@@ -49,12 +50,7 @@ class ReconcileReport:
     strategy_equity_usdt: Decimal | None = None
     strategy_start_utc: datetime | None = None
     per_trade_risk_limit_usdt: Decimal | None = None
-
-
-def _decimal(value: object, *, positive: bool = False) -> Decimal:
-    if not isinstance(value, Decimal) or not value.is_finite() or (positive and value <= 0):
-        raise ValueError("Некорректная сумма или цена")
-    return value
+    diagnostic_checks: tuple[tuple[str, str], ...] = ()
 
 
 def _fill_fees(rows: list[dict], now: datetime) -> tuple[tuple[str, Decimal], ...]:
@@ -87,7 +83,7 @@ def _fill_fees(rows: list[dict], now: datetime) -> tuple[tuple[str, Decimal], ..
 
 class DemoReconciler:
     def __init__(
-        self, *, market_provider: Callable[[], MarketSnapshot], demo_client: DemoClient,
+        self, *, market_provider: Callable[[], MarketSnapshot | PublicQuoteEvidence], demo_client: DemoClient,
         journal: DecisionJournal, risk_manager: RiskManager,
         budget_store: StrategyBudgetStore | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -106,28 +102,36 @@ class DemoReconciler:
             return ReconcileReport(ReconcileStatus.BLOCKED, ("Текущее время UTC неизвестно",))
         reasons: list[str] = []
         values: dict = {}
+        checks: list[tuple[str, str]] = []
         try:
             self.risk_manager.validate_settings()
+            checks.append(("RISK_SETTINGS", "OK"))
+        except (RiskStateError, OSError, ValueError):
+            checks.append(("RISK_SETTINGS", "BLOCKED"))
+            reasons.append("RISK_SETTINGS: настройки Risk Manager недоступны либо противоречивы")
+        try:
             audit = self.journal.audit_read_only()
             if audit.executed_count:
+                checks.append(("JOURNAL", "BLOCKED"))
                 reasons.append("Журнал содержит исполнение без проверенного происхождения")
-        except (JournalError, RiskStateError, OSError, ValueError):
-            reasons.append("Журнал решений или настройки Risk Manager недоступны либо противоречивы")
+            else:
+                checks.append(("JOURNAL", "OK"))
+        except (JournalError, OSError, ValueError):
+            checks.append(("JOURNAL", "BLOCKED"))
+            reasons.append("JOURNAL: Журнал решений недоступен либо противоречив")
         try:
             market = self.market_provider()
-            instrument = market.instrument
-            price = _decimal(market.last_price, positive=True)
-            if (not isinstance(instrument, SpotInstrument) or instrument.instrument_id != "BTC-USDT"
-                    or instrument.state != "live" or instrument.base_currency != "BTC"
-                    or instrument.quote_currency != "USDT"
-                    or not _fresh(market.ticker_as_of_utc, self.clock(), MAX_TICKER_AGE)):
-                raise ValueError("Цена или инструмент BTC-USDT SPOT неизвестны либо устарели")
-            for size in (instrument.min_size, instrument.lot_size, instrument.tick_size,
-                         instrument.max_limit_size, instrument.max_market_size):
-                _decimal(size, positive=True)
-            values.update(instrument=instrument, btc_price_usdt=price)
+            assessment = assess_public_quote(market, self.clock(), max_ticker_age=MAX_TICKER_AGE)
         except Exception:
-            reasons.append("Цена или ограничения BTC-USDT SPOT недоступны, устарели либо противоречивы")
+            checks.extend((name, "BLOCKED") for name in ("PRICE", "QUOTE_TIME", "INSTRUMENT", "LIMITS"))
+            reasons.append("MARKET: поставщик публичных GET-данных недоступен")
+        else:
+            checks.extend(assessment.checks)
+            reasons.extend(assessment.reasons)
+            if assessment.instrument is not None:
+                values["instrument"] = assessment.instrument
+            if assessment.price is not None:
+                values["btc_price_usdt"] = assessment.price
         try:
             btc, usdt = self.demo_client.get_balances()
             checked_at = self.clock()
@@ -165,12 +169,18 @@ class DemoReconciler:
             rates = self.demo_client.get_spot_fee_rates()
             if not isinstance(rates, SpotFeeRates):
                 raise ValueError("Нет ставки комиссии")
-            for rate in (rates.maker, rates.taker):
+            for name, rate in (("maker", rates.maker), ("taker", rates.taker)):
                 if not isinstance(rate, Decimal) or not rate.is_finite() or not -1 < rate < 1:
-                    raise ValueError("Недостоверная ставка комиссии")
+                    raise ValueError(name)
             values.update(maker_fee_rate=rates.maker, taker_fee_rate=rates.taker)
+            checks.append(("FEES", "OK"))
+        except ValueError as exc:
+            checks.append(("FEES", "BLOCKED"))
+            field = str(exc) if str(exc) in ("maker", "taker") else "maker/taker"
+            reasons.append(f"FEES: ставка {field} отсутствует или некорректна")
         except Exception:
-            reasons.append("Ставки Demo-комиссии BTC-USDT SPOT недоступны")
+            checks.append(("FEES", "BLOCKED"))
+            reasons.append("FEES: Demo GET ставок комиссии недоступен")
 
         # The existing journal records hypothetical decisions only, never fills.
         # Until a verified ownership ledger exists, all BTC is treated as external.
@@ -180,9 +190,20 @@ class DemoReconciler:
         try:
             state = self.risk_manager.inspect_daily_state(self.clock())
             if state.pending_entry or state.loss_locked or state.entries_used:
+                checks.append(("RISK_STATE", "BLOCKED"))
                 reasons.append("Дневное состояние Risk Manager содержит резерв, блокировку или вход без сверки")
+            else:
+                checks.append(("RISK_STATE", "OK"))
         except (RiskStateError, OSError, ValueError):
             state = None
+            try:
+                self.risk_manager.state_path.stat()
+                missing_state = False
+            except FileNotFoundError:
+                missing_state = True
+            except OSError:
+                missing_state = False
+            checks.append(("RISK_STATE", "UNINITIALIZED" if missing_state else "BLOCKED"))
             reasons.append("Подтверждённая дневная база Risk Manager отсутствует или недоступна")
 
         if self.budget_store is not None:
@@ -222,7 +243,9 @@ class DemoReconciler:
                                   per_trade_risk_limit_usdt=(baseline.strategy_capital_usdt
                                                               * self.risk_manager.settings.risk_per_trade))
                 return ReconcileReport(ReconcileStatus.BLOCKED if reasons else ReconcileStatus.READY,
-                                       tuple(reasons), checked_at_utc=self.clock(), **values)
+                                       tuple(reasons), checked_at_utc=self.clock(),
+                                       diagnostic_checks=tuple(checks), **values)
         reasons.append("Дневной капитал, PnL и происхождение позиции не подтверждены; риск не рассчитан")
         return ReconcileReport(ReconcileStatus.BLOCKED if reasons else ReconcileStatus.READY,
-                               tuple(reasons), checked_at_utc=self.clock(), **values)
+                               tuple(reasons), checked_at_utc=self.clock(),
+                               diagnostic_checks=tuple(checks), **values)

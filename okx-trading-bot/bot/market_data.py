@@ -49,6 +49,27 @@ class MarketSnapshot:
         return self.candles[-1]
 
 
+@dataclass(frozen=True)
+class PublicQuoteEvidence:
+    """Independent public GET results; a failed endpoint cannot hide the other."""
+
+    instrument: SpotInstrument | None
+    last_price: Decimal | None
+    ticker_as_of_utc: datetime | None
+    issues: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PublicQuoteAssessment:
+    """Only independently validated evidence may be used for Demo accounting."""
+
+    instrument: SpotInstrument | None
+    price: Decimal | None
+    ticker_as_of_utc: datetime | None
+    checks: tuple[tuple[str, str], ...]
+    reasons: tuple[str, ...]
+
+
 def _positive_decimal(value: Any, field: str) -> Decimal:
     try:
         result = Decimal(str(value))
@@ -83,6 +104,118 @@ def read_spot_instrument(client: OkxClient) -> SpotInstrument:
         max_market_size=(_positive_decimal(instrument_data["maxMktSz"], "maxMktSz")
                          if instrument_data.get("maxMktSz") not in (None, "") else None),
     )
+
+
+def get_public_quote_evidence(client: OkxClient) -> PublicQuoteEvidence:
+    """Read BTC-USDT instrument and ticker independently; never request candles."""
+    instrument = None
+    price = None
+    ticker_time = None
+    issues: list[str] = []
+    try:
+        instrument = read_spot_instrument(client)
+    except OkxResponseError as exc:
+        field = next((name for name in ("minSz", "lotSz", "tickSz", "maxLmtSz", "maxMktSz")
+                      if str(exc) == f"Invalid {name} in OKX response"), None)
+        issues.append((f"LIMITS: поле {field} отсутствует или некорректно" if field
+                       else "INSTRUMENT: публичный ответ инструмента повреждён или отклонён"))
+    except Exception:
+        # HTTP/API exception text is deliberately not echoed into a diagnostic.
+        issues.append("INSTRUMENT: публичный GET инструмента недоступен или ответ повреждён")
+    try:
+        ticker = _one_record(client.get_ticker(), "ticker")
+    except Exception:
+        issues.append("PRICE: публичный GET тикера недоступен или ответ повреждён")
+    else:
+        if ticker.get("instId") != "BTC-USDT":
+            issues.append("PRICE: ticker.instId не равен BTC-USDT")
+        else:
+            try:
+                price = _positive_decimal(ticker.get("last"), "last price")
+            except OkxResponseError:
+                issues.append("PRICE: ticker.last отсутствует или некорректен")
+            raw_time = ticker.get("ts")
+            if not isinstance(raw_time, str) or not raw_time.isascii() or not raw_time.isdigit():
+                issues.append("QUOTE_TIME: ticker.ts отсутствует или некорректен")
+            else:
+                try:
+                    ticker_time = datetime.fromtimestamp(int(raw_time) / 1000, tz=timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    issues.append("QUOTE_TIME: ticker.ts вне диапазона UTC")
+    return PublicQuoteEvidence(instrument, price, ticker_time, tuple(issues))
+
+
+def assess_public_quote(
+    evidence: PublicQuoteEvidence | MarketSnapshot, now: datetime,
+    *, max_ticker_age: timedelta = timedelta(seconds=60),
+) -> PublicQuoteAssessment:
+    """Separate price, freshness, identity and limit checks; fail closed."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() != timedelta(0):
+        raise ValueError("Current UTC time is invalid")
+    if not isinstance(evidence, (PublicQuoteEvidence, MarketSnapshot)):
+        raise ValueError("Public quote evidence is unavailable")
+    reasons = list(evidence.issues) if isinstance(evidence, PublicQuoteEvidence) else []
+    checks: list[tuple[str, str]] = []
+    raw_price = evidence.last_price
+    if not isinstance(raw_price, Decimal) or not raw_price.is_finite() or raw_price <= 0:
+        checks.append(("PRICE", "BLOCKED"))
+        if not any(reason.startswith("PRICE:") for reason in reasons):
+            reasons.append("PRICE: положительная конечная цена ticker.last не подтверждена")
+    else:
+        checks.append(("PRICE", "OK"))
+    at = evidence.ticker_as_of_utc
+    if not isinstance(at, datetime) or at.tzinfo is None or at.utcoffset() != timedelta(0):
+        checks.append(("QUOTE_TIME", "BLOCKED"))
+        if not any(reason.startswith("QUOTE_TIME:") for reason in reasons):
+            reasons.append("QUOTE_TIME: время тикера неизвестно или не UTC")
+    elif at > now:
+        checks.append(("QUOTE_TIME", "BLOCKED"))
+        reasons.append(f"QUOTE_TIME: ticker.ts {at.isoformat()} находится в будущем относительно UTC сервера")
+    elif now - at > max_ticker_age:
+        checks.append(("QUOTE_TIME", "BLOCKED"))
+        reasons.append(f"QUOTE_TIME: котировка старше {int(max_ticker_age.total_seconds())} секунд "
+                       f"(возраст {int((now - at).total_seconds())} с; ticker.ts {at.isoformat()})")
+    else:
+        checks.append(("QUOTE_TIME", "OK"))
+    instrument = evidence.instrument
+    instrument_faults = []
+    if not isinstance(instrument, SpotInstrument):
+        instrument_faults.append("запись инструмента отсутствует")
+    else:
+        for name, actual, required in (("instId", instrument.instrument_id, "BTC-USDT"),
+                                       ("state", instrument.state, "live"),
+                                       ("baseCcy", instrument.base_currency, "BTC"),
+                                       ("quoteCcy", instrument.quote_currency, "USDT")):
+            if actual != required:
+                instrument_faults.append(f"{name} не равен {required}")
+    if instrument_faults:
+        checks.append(("INSTRUMENT", "BLOCKED"))
+        if not any(reason.startswith("INSTRUMENT:") for reason in reasons):
+            reasons.append("INSTRUMENT: " + ", ".join(instrument_faults))
+    else:
+        checks.append(("INSTRUMENT", "OK"))
+    bad_limits = []
+    if isinstance(instrument, SpotInstrument):
+        for name, value in (("minSz", instrument.min_size), ("lotSz", instrument.lot_size),
+                            ("tickSz", instrument.tick_size), ("maxLmtSz", instrument.max_limit_size),
+                            ("maxMktSz", instrument.max_market_size)):
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                bad_limits.append(name)
+        if ("minSz" not in bad_limits and "maxLmtSz" not in bad_limits
+                and instrument.max_limit_size < instrument.min_size):
+            bad_limits.append("maxLmtSz<minSz")
+    else:
+        bad_limits.append("instrument GET")
+    if bad_limits:
+        checks.append(("LIMITS", "BLOCKED"))
+        reasons.append("LIMITS: ограничения отсутствуют или противоречивы; поля " + ", ".join(bad_limits))
+    else:
+        checks.append(("LIMITS", "OK"))
+    statuses = dict(checks)
+    confirmed_instrument = (instrument if statuses["INSTRUMENT"] == statuses["LIMITS"] == "OK" else None)
+    confirmed_price = (raw_price if statuses["PRICE"] == statuses["QUOTE_TIME"] == "OK" else None)
+    return PublicQuoteAssessment(confirmed_instrument, confirmed_price, at,
+                                 tuple(checks), tuple(dict.fromkeys(reasons)))
 
 
 def get_market_snapshot(client: OkxClient) -> MarketSnapshot:

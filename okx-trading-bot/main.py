@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import sys
@@ -13,7 +14,7 @@ from bot.execution_engine import ExecutionEngine
 from bot.execution_diagnostics import inspect_execution
 from bot.server_sqlite_setup import SQLITE_CONFIRMATION_PHRASE, ServerSqliteSetup, SqliteSetupError
 from bot.journal import DecisionJournal, JournalError
-from bot.market_data import get_market_snapshot
+from bot.market_data import assess_public_quote, get_market_snapshot, get_public_quote_evidence
 from bot.okx_client import OkxClient, OkxError
 from bot.order_preview import preview_demo_buy
 from bot.protection_capabilities import inspect_protection_capabilities
@@ -71,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--demo-check", action="store_true", help="Read the virtual OKX Demo account once")
     commands.add_argument("--dry-run", action="store_true", help="Record one non-executing Demo analysis cycle")
     commands.add_argument("--reconcile", action="store_true", help="Read-only Demo/Risk Manager reconciliation")
+    commands.add_argument("--market-diagnose", action="store_true", help="Public GET-only quote and instrument diagnosis")
     commands.add_argument("--budget-preview", action="store_true", help="Inspect the one-time 5000 USDT Demo allocation")
     commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
     commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
@@ -178,6 +180,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if any(value is not None for value in research_inputs):
         parser.error("--research-* параметры используются только с --growth-research")
+
+    if args.market_diagnose:
+        try:
+            evidence = get_public_quote_evidence(OkxClient(Config.from_environment()))
+            assessment = assess_public_quote(evidence, datetime.now(timezone.utc))
+        except (ConfigError, OkxError, ValueError, OSError):
+            print("Публичные данные BTC-USDT: BLOCKED — регион или конфигурация недоступны", file=sys.stderr)
+            return 1
+        print("Публичные данные BTC-USDT SPOT: " + ("OK" if not assessment.reasons else "BLOCKED"))
+        for name, status in assessment.checks:
+            print(f"{name}: {status}")
+        if evidence.last_price is not None:
+            print(f"ticker.last: {evidence.last_price} USDT")
+        if evidence.ticker_as_of_utc is not None:
+            print(f"ticker.ts UTC: {evidence.ticker_as_of_utc.isoformat()}")
+        if evidence.instrument is not None:
+            instrument = evidence.instrument
+            print(f"Инструмент: {instrument.instrument_id}, state={instrument.state}, "
+                  f"baseCcy={instrument.base_currency}, quoteCcy={instrument.quote_currency}")
+            print(f"minSz={instrument.min_size}, lotSz={instrument.lot_size}, tickSz={instrument.tick_size}, "
+                  f"maxLmtSz={instrument.max_limit_size}, maxMktSz={instrument.max_market_size}")
+        for reason in assessment.reasons:
+            print(f"Причина BLOCKED: {reason}")
+        print("Только публичные GET; Demo-ключи и торговая SQLite не использовались")
+        return 0 if not assessment.reasons else 1
 
     if args.sqlite_prepare or args.sqlite_init is not None:
         setup = ServerSqliteSetup()
@@ -465,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         journal = DecisionJournal()
         initializer = BudgetInitializer(
-            market_provider=lambda: get_market_snapshot(OkxClient(demo_client.config)),
+            market_provider=lambda: get_public_quote_evidence(OkxClient(demo_client.config)),
             demo_client=demo_client, journal=journal, risk_manager=RiskManager(),
             store=StrategyBudgetStore(journal.path),
         )
@@ -477,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Виртуальный счёт: USDT {report.usdt_total} (доступно {report.usdt_available}), "
                       f"внешний BTC {report.btc_total}")
             print("Выделяемый капитал стратегии: 5000 USDT; внешний BTC в него не входит")
+            for name, status in report.diagnostic_checks:
+                print(f"Проверка {name}: {status}")
             if preview.ready_to_confirm:
                 print("Бюджет ещё не записан. Для отдельного явного подтверждения выполните:")
                 print(f'.\\.venv\\Scripts\\python.exe main.py --confirm-budget "{CONFIRMATION_PHRASE}" '
@@ -504,11 +533,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         journal = DecisionJournal()
         report = DemoReconciler(
-            market_provider=lambda: get_market_snapshot(OkxClient(demo_client.config)),
+            market_provider=lambda: get_public_quote_evidence(OkxClient(demo_client.config)),
             demo_client=demo_client, journal=journal, risk_manager=RiskManager(),
             budget_store=StrategyBudgetStore(journal.path),
         ).run_once()
         print(f"Сверка OKX Demo BTC-USDT SPOT: {report.status.value}")
+        for name, status in report.diagnostic_checks:
+            print(f"Проверка {name}: {status}")
         if report.btc_total is not None and report.usdt_total is not None:
             print(f"Виртуальный баланс: BTC {report.btc_total} (доступно {report.btc_available}), "
                   f"USDT {report.usdt_total} (доступно {report.usdt_available})")

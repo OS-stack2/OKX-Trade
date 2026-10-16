@@ -239,6 +239,30 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("Algo ID, статус", " ".join(report.reasons))
         self.assertEqual(report.confirmed_sl_btc, 0)
 
+    def test_delayed_stop_algo_id_stays_halted_after_restart_and_repeat(self):
+        self._save_protection(stop_id=None)
+        self.demo.pending = (DemoAlgoOrder("tp-1", "oco", "live", D("0.0099"), "sell"),)
+        self.demo.algos["tp-1"] = self.demo.pending[0]
+        risk_before = self.risk.state_path.read_bytes()
+        budget_before = self.store.read()
+        restarted = RecoveryManager(
+            engine=ExecutionEngine(journal=self.journal, risk_manager=self.risk,
+                                   budget_store=self.store, clock=lambda: NOW),
+            client_loader=lambda: self.demo, alerter_loader=lambda: self.alerts,
+            budget_store=self.store,
+        )
+        first = restarted.check_once()
+        second = restarted.check_once()
+        for report in (first, second):
+            self.assertTrue(report.halted)
+            self.assertEqual(report.external_btc, D("1"))
+            self.assertEqual(report.confirmed_sl_btc, 0)
+            self.assertIn("Algo ID ещё не подтверждён", " ".join(report.reasons))
+        self.assertEqual(self.risk.state_path.read_bytes(), risk_before)
+        self.assertEqual(self.store.read(), budget_before)
+        self.assertEqual(len(self.engine.diagnose().intents), 1)
+        self.assertFalse(any("POST" in call or "SELL" in call for call in self.demo.calls))
+
     def test_exact_algo_get_still_cannot_prove_parent_or_prevent_double_sale(self):
         self._save_protection()
         sl = DemoAlgoOrder("sl-1", "conditional", "live", D("0.0099"), "sell")
