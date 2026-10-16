@@ -39,6 +39,8 @@ from bot.trend_trader import (TrendSettings, TrendStore, TrendTrader, read_daily
                               resume as trend_resume, trend_state_path_from_env)
 from bot.market_data import read_spot_instrument
 from bot.demo_report import build_report
+from bot.bot_ledger import read_bot_holdings
+from bot.run_monitor import RunMonitor, monitor_path_from_env
 from config import Config, ConfigError
 import sqlite3
 
@@ -116,14 +118,29 @@ def _demo_trader_command(args: argparse.Namespace) -> int:
         report = trader.run_once()
     except (ConfigError, TraderError, OSError, sqlite3.Error) as exc:
         print(f"Demo-трейдер: BLOCK — {exc}", file=sys.stderr)
+        _record_run("demo-trader", False, str(exc))
         return 1
     except OkxError as exc:
         print(f"Demo-трейдер: публичные данные OKX недоступны — {exc}", file=sys.stderr)
+        _record_run("demo-trader", False, f"публичные данные OKX: {exc}")
         return 1
     print(f"OKX Demo-трейдер BTC-USDT: {report.status}")
     for line in report.lines:
         print(line)
+    _record_run("demo-trader", report.status != "ERROR", report.lines[-1] if report.lines else "")
     return report.exit_code
+
+
+def _record_run(name: str, ok: bool, detail: str) -> None:
+    """Silent-failure tracking; it must never break the bot run itself."""
+    try:
+        message = RunMonitor(monitor_path_from_env()).record(name, ok, datetime.now(timezone.utc), detail)
+        if message:
+            alerter = TelegramAlerter.from_env_file()
+            if alerter is not None:
+                alerter.send_text("OKX Demo: " + message)
+    except Exception:
+        pass
 
 
 def _trend_command(args: argparse.Namespace) -> int:
@@ -165,10 +182,12 @@ def _trend_command(args: argparse.Namespace) -> int:
         report = trader.run_once()
     except (ConfigError, OkxError, OSError, sqlite3.Error) as exc:
         print(f"Тренд-бот: BLOCK — {exc}", file=sys.stderr)
+        _record_run("demo-trend", False, str(exc))
         return 1
     print(f"OKX Demo тренд-бот BTC: {report.status}")
     for line in report.lines:
         print(line)
+    _record_run("demo-trend", report.status != "ERROR", report.lines[-1] if report.lines else "")
     return report.exit_code
 
 
@@ -441,7 +460,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.watchdog_once:
         try:
-            report = Watchdog(store=WatchdogStore(watchdog_path_from_env())).run_once()
+            report = Watchdog(store=WatchdogStore(watchdog_path_from_env()),
+                              ledger_loader=read_bot_holdings).run_once()
         except (WatchdogError, OSError):
             print("Watchdog: отдельный журнал или локальная конфигурация недоступны", file=sys.stderr)
             return 1

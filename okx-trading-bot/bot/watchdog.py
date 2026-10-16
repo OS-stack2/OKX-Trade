@@ -18,6 +18,7 @@ from pathlib import Path
 import sqlite3
 from typing import Callable, Iterator
 
+from bot.bot_ledger import BTC_TOLERANCE, BotHoldings
 from bot.demo_client import CurrencyBalance, DemoAlgoOrder, DemoClient
 from bot.okx_client import OkxClient
 from bot.telegram_alerts import TelegramAlerter
@@ -228,8 +229,8 @@ class WatchdogStore:
             raise WatchdogError("Отдельный журнал Watchdog недоступен") from exc
 
     def record(self, *, at_utc: datetime, status: str,
-               snapshot: WatchdogSnapshot | None, reasons: tuple[str, ...]
-               ) -> tuple[str, bool, tuple[tuple[int, str], ...]]:
+               snapshot: WatchdogSnapshot | None, reasons: tuple[str, ...],
+               explained: bool = False) -> tuple[str, bool, tuple[tuple[int, str], ...]]:
         """Atomically save the observation and claim one attempt per new alert."""
         if status not in {"API_UNAVAILABLE", "SUSPICIOUS", "OBSERVED_UNVERIFIED"}:
             raise WatchdogError("Недопустимый статус Watchdog")
@@ -249,7 +250,9 @@ class WatchdogStore:
                 raise WatchdogError("Последний успешный снимок Watchdog отсутствует")
             previous = WatchdogSnapshot.from_json(previous_json) if previous_json is not None else None
             changed = snapshot is not None and previous is not None and snapshot != previous
-            if changed:
+            if changed and explained and status != "SUSPICIOUS":
+                reasons += ("Изменение объяснено журналами Demo-ботов",)
+            elif changed:
                 status = "SUSPICIOUS"
                 reasons += ("Снимок BTC/USDT или ордеров изменился после предыдущей проверки",)
             events: list[str] = []
@@ -262,7 +265,7 @@ class WatchdogStore:
                     events.append("WATCHDOG_RESTORED")
                 if (changed or previous is None) and status == "SUSPICIOUS":
                     events.append("WATCHDOG_SUSPICIOUS")
-                elif changed:
+                elif changed and not explained:
                     events.append("WATCHDOG_CHANGED")
                 new_health, new_json = "UP", snapshot.to_json()
             db.execute("""INSERT INTO watchdog_state(id,health,snapshot_json,updated_at_utc)
@@ -296,12 +299,15 @@ class Watchdog:
                  demo_loader: Callable[[], DemoClient] = DemoClient.from_env_file,
                  public_factory: Callable[[Config], OkxClient] = OkxClient,
                  alerter_loader: Callable[[], TelegramAlerter | None] = TelegramAlerter.from_env_file,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 ledger_loader: Callable[[], BotHoldings | None] | None = None) -> None:
         self.store = store
         self.demo_loader = demo_loader
         self.public_factory = public_factory
         self.alerter_loader = alerter_loader
         self.clock = clock
+        self.ledger_loader = ledger_loader
+        self._algo_ids: tuple[str, ...] = ()
 
     def _snapshot(self) -> WatchdogSnapshot:
         demo = self.demo_loader()
@@ -347,6 +353,7 @@ class Watchdog:
                                             order.get("side"), order.get("sz"),
                                             order.get("accFillSz"))))
         algo_tokens: list[str] = []
+        self._algo_ids = tuple(algo.algo_id for algo in algos if isinstance(algo, DemoAlgoOrder))
         unknown_algo_sizes = False
         for algo in algos:
             if not isinstance(algo, DemoAlgoOrder):
@@ -360,6 +367,20 @@ class Watchdog:
                                 tuple(sorted(order_tokens)), tuple(sorted(algo_tokens)),
                                 other, unknown_algo_sizes)
 
+    def _explained_by_bots(self, snapshot: WatchdogSnapshot) -> bool:
+        """True only when every BTC unit and Algo order is accounted for by the bot journals."""
+        if self.ledger_loader is None:
+            return False
+        try:
+            holdings = self.ledger_loader()
+        except Exception:
+            return False
+        if holdings is None or snapshot.spot_order_count or snapshot.unknown_algo_sizes:
+            return False
+        if not set(self._algo_ids) <= holdings.algo_ids:
+            return False
+        return abs(snapshot.btc_total - (holdings.external_btc + holdings.btc)) <= BTC_TOLERANCE
+
     def run_once(self) -> WatchdogReport:
         now = self.clock()
         try:
@@ -369,32 +390,36 @@ class Watchdog:
                                   ("Время UTC недоступно",), (), False)
         try:
             snapshot = self._snapshot()
-            reasons = ["Принадлежность BTC и фактическое покрытие SL неизвестны без журнала стратегии"]
+            explained = self._explained_by_bots(snapshot)
+            reasons = (["BTC и Algo-ордера сверены с журналами Demo-ботов"] if explained else
+                       ["Принадлежность BTC и фактическое покрытие SL неизвестны без журнала стратегии"])
             if snapshot.spot_order_count:
                 reasons.append("Есть открытые SPOT-ордера неизвестного происхождения")
-            if snapshot.algo_order_count:
+            if snapshot.algo_order_count and not explained:
                 reasons.append("Есть Algo-ордера без доказанной связи с BTC бота")
             if snapshot.other_spot_orders:
                 reasons.append("Есть SPOT-ордера по другому инструменту")
             if snapshot.unknown_algo_sizes:
                 reasons.append("Размер одного или нескольких Algo-ордеров неизвестен")
-            if snapshot.btc_available < snapshot.btc_total and not snapshot.spot_order_count:
+            if (snapshot.btc_available < snapshot.btc_total and not snapshot.spot_order_count
+                    and not (explained and snapshot.algo_order_count)):
                 reasons.append("Часть BTC зарезервирована без понятного SPOT-ордера")
             if snapshot.usdt_available < snapshot.usdt_total and not snapshot.spot_order_count:
                 reasons.append("Часть USDT зарезервирована без понятного SPOT-ордера")
             status = "SUSPICIOUS" if len(reasons) > 1 else "OBSERVED_UNVERIFIED"
         except Exception:
             # Never print transport errors: URLs and headers can contain secrets.
-            snapshot, status = None, "API_UNAVAILABLE"
+            snapshot, status, explained = None, "API_UNAVAILABLE", False
             reasons = ["Публичный или приватный Demo GET недоступен либо ответ противоречив"]
         try:
-            status, changed, alerts = self.store.record(at_utc=now, status=status,
-                                                        snapshot=snapshot, reasons=tuple(reasons))
+            status, changed, alerts = self.store.record(at_utc=now, status=status, snapshot=snapshot,
+                                                        reasons=tuple(reasons), explained=explained)
         except (WatchdogError, OSError, sqlite3.Error):
             return WatchdogReport("JOURNAL_ERROR", None, False,
                                   ("Отдельный журнал Watchdog недоступен; состояние неизвестно",), (), False)
         if changed:
-            reasons.append("Снимок BTC/USDT или ордеров изменился после предыдущей проверки")
+            reasons.append("Изменение объяснено журналами Demo-ботов" if explained and status != "SUSPICIOUS"
+                           else "Снимок BTC/USDT или ордеров изменился после предыдущей проверки")
         notifications: list[str] = []
         alert_failed = False
         try:

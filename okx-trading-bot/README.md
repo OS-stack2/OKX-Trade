@@ -586,3 +586,16 @@ sudo systemctl daemon-reload && sudo systemctl enable --now okx-demo-trend.timer
 sudo install -o root -g root -m 644 deploy/systemd/okx-demo-report.* deploy/systemd/okx-demo-final.* /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now okx-demo-report.timer okx-demo-final.timer
 ```
+
+## Оповещения о тихих сбоях и Watchdog с учётом ботов (этап 5.3)
+
+**Сбои ботов.** Каждый запуск `--demo-trade-once`/`--trend-once` записывает результат в `OKX_RUNMON_STATE_PATH`. Третья ошибка подряд (недоступный API, неверное время, отозванный ключ…) даёт одно сообщение в Telegram с текстом ошибки; первый успешный запуск после этого — сообщение «снова работает». Отдельно `python -m bot.run_monitor` (`okx-demo-runmon.timer`, каждые 15 минут) сообщает, если у бота с включённым таймером нет успешного запуска дольше 30 минут (EMA) или 3 часов (тренд) — это ловит падение ещё до старта кода бота. Модуль сторожа намеренно не импортирует торговый код.
+
+**Watchdog.** Изменения баланса и ордеров больше не считаются подозрительными, если они полностью объяснены журналами ботов: BTC на счёте = `OKX_WATCHDOG_EXTERNAL_BTC` (по умолчанию 1) + BTC открытой позиции EMA-бота + BTC книги тренд-бота (допуск 0,00001 BTC на «пыль» комиссий), все Algo-ордера — сохранённые OCO бота, открытых SPOT-ордеров нет, ни один бот не находится посреди сделки. Любое расхождение по-прежнему даёт `SUSPICIOUS` и Telegram. Журналы ботов Watchdog открывает только на чтение.
+
+```bash
+sudo install -o root -g root -m 644 deploy/systemd/okx-demo-runmon.* /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now okx-demo-runmon.timer
+```
+
+В `.env`: `OKX_RUNMON_STATE_PATH=/var/lib/okx-watchdog/run_monitor.sqlite3`.
