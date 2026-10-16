@@ -21,6 +21,7 @@ from bot.budget_setup import BudgetInitializer
 from bot.strategy_budget import BudgetError, CONFIRMATION_PHRASE, StrategyBudgetStore
 from bot.strategy import StrategyError, evaluate_signal
 from bot.telegram_alerts import TelegramAlerter
+from bot.watchdog import Watchdog, WatchdogError, WatchdogStore, watchdog_path_from_env
 from config import Config, ConfigError
 
 
@@ -40,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--protection-simulate", action="store_true", help="Offline BUY/SL/TP lifecycle scenarios in temporary SQLite")
     commands.add_argument("--recovery-check", action="store_true", help="Read-only Demo GET recovery and durable emergency halt")
     commands.add_argument("--telegram-test", action="store_true", help="Send one owner alert through the local Demo Telegram configuration")
+    commands.add_argument("--watchdog-once", action="store_true", help="One Demo GET observation using a separate Watchdog journal")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     args = parser.parse_args(argv)
@@ -47,6 +49,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--budget-token используется только с --confirm-budget")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+
+    if args.watchdog_once:
+        try:
+            report = Watchdog(store=WatchdogStore(watchdog_path_from_env())).run_once()
+        except (WatchdogError, OSError):
+            print("Watchdog: отдельный журнал или локальная конфигурация недоступны", file=sys.stderr)
+            return 1
+        print(f"OKX Watchdog Demo BTC-USDT SPOT: {report.status}")
+        if report.snapshot is not None:
+            snap = report.snapshot
+            print(f"Виртуальный баланс: BTC {snap.btc_total} (доступно {snap.btc_available}), "
+                  f"USDT {snap.usdt_total} (доступно {snap.usdt_available})")
+            print(f"Открытых SPOT-ордеров: {snap.spot_order_count}; ожидающих Algo: {snap.algo_order_count}")
+        for reason in report.reasons:
+            print(f"Наблюдение: {reason}")
+        for notification in report.notifications:
+            print(f"Telegram: {notification}")
+        print("Принадлежность BTC и защита не подтверждаются Watchdog; торговля отключена")
+        return report.exit_code
 
     if args.telegram_test:
         try:

@@ -145,8 +145,6 @@ EMA начинается со среднего арифметического п
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Существующий бюджет 5 000 виртуальных USDT, риск 0,5%/2%, стоп 1%, тейк 2% и база UTC не менялись. Торговых POST, переводов, LIVE и продажи внешнего BTC нет.
-
 ## Диагностика возможностей защиты (этап 4B.2B-2C)
 
 Из папки `okx-trading-bot` в Windows PowerShell, с уже настроенным локальным `.env` для **отдельного Demo Read-only ключа**, выполните:
@@ -242,3 +240,59 @@ EMA начинается со среднего арифметического п
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+## OKX Watchdog для Ubuntu 24.04 (этап 4B.2B-2G)
+
+`--watchdog-once` выполняет **одну** проверку и завершает процесс. Она читает публичный BTC-USDT ticker и отдельные Demo GET баланса BTC/USDT, всех открытых SPOT-ордеров и ожидающих conditional/OCO Algo-ордеров. Путь к рабочей Windows SQLite команда не открывает: её снимки, состояние связи и отметки об уведомлениях находятся только в отдельном `watchdog.sqlite3`. При отсутствии `OKX_WATCHDOG_STATE_PATH` локальный путь — `watchdog_data/watchdog.sqlite3`, исключённый из Git; для systemd путь явно задаётся как `/var/lib/okx-watchdog/watchdog.sqlite3`.
+
+Отчёт `OBSERVED_UNVERIFIED` означает лишь, что GET завершились и снимок сохранён. Даже при пустых списках ордеров Watchdog **не знает**, какой BTC принадлежит стратегии, и не подтверждает наличие SL: `CLEAR` и разрешение торговли он никогда не выдаёт. Изменение BTC/USDT или ордеров, неизвестные открытые заявки, Algo-ордера и необъяснимое резервирование отмечаются как `SUSPICIOUS`; ошибка или устаревший ticker — как `API_UNAVAILABLE`. При недоступном отдельном журнале результат `JOURNAL_ERROR`. Исходный 1 BTC не считается позицией бота и не используется для операций. Код выхода `0` возможен только при сохранённом обычном наблюдении без ошибки уведомления; остальные исходы дают `1`.
+
+Предыдущий успешный снимок переживает таймауты и перезапуски. Telegram получает одно уведомление на начало сбоя, одно при восстановлении связи и уведомление при новом изменении или подозрительном снимке. Повторная одинаковая проверка не отправляет дубликат. Попытка уведомления записывается **до** вызова Telegram; неоднозначный тайм-аут не вызывает повторную отправку того же события. Это ограничивает дубли, но Telegram не предоставляет гарантии «ровно один раз»: при обрыве после записи попытки сообщение может не дойти. Проверяйте `journalctl`, если сервис сообщает об ошибке доставки. SQLite хранит максимум 576 наблюдений (около двух суток) и 200 отметок уведомлений; исходные ключи, HTTP-заголовки и идентификаторы ордеров в журнал не записываются (для сравнения используются хеши).
+
+Ниже — **инструкция для будущей отдельной установки**. В этом этапе на сервере ничего не устанавливалось и существующие сервисы, SSH и сетевые настройки не менялись. Команды выполняйте на Ubuntu 24.04 только для нового `/opt/okx-watchdog` и новых файлов `okx-watchdog.service`/`.timer`:
+
+1. Убедитесь, что доступны `git`, Python 3.11+ и модуль `venv`: `git --version`, `python3 --version`, `python3 -m venv --help`. Проверьте часы командой `timedatectl status`. Если какого-то пакета нет, установите только недостающий после проверки сервера.
+2. Убедитесь, что отдельный пользователь `okx-watchdog`, каталог `/opt/okx-watchdog` и одноимённые unit-файлы ещё не существуют: `id okx-watchdog` должен сообщить, что пользователя нет; затем выполните `test ! -e /opt/okx-watchdog`, `test ! -e /etc/systemd/system/okx-watchdog.service`, `test ! -e /etc/systemd/system/okx-watchdog.timer`. Если что-то существует, остановитесь и проверьте вручную; не перезаписывайте файлы.
+3. Создайте отдельного пользователя и новую копию кода:
+
+   ```bash
+   sudo useradd --system --home /var/lib/okx-watchdog --no-create-home --shell /usr/sbin/nologin okx-watchdog
+   sudo git clone --branch main --depth 1 https://github.com/OS-stack2/OKX-Trade.git /opt/okx-watchdog
+   sudo python3 -m venv /opt/okx-watchdog/okx-trading-bot/.venv
+   ```
+
+4. Создайте **новый** `.env` с правами только для пользователя Watchdog. Перед `install` убедитесь, что файла ещё нет; не копируйте Windows `.env` или рабочую SQLite:
+
+   ```bash
+   sudo test ! -e /opt/okx-watchdog/okx-trading-bot/.env
+   sudo install -o okx-watchdog -g okx-watchdog -m 600 /dev/null /opt/okx-watchdog/okx-trading-bot/.env
+   sudoedit /opt/okx-watchdog/okx-trading-bot/.env
+   sudo stat -c '%U %G %a' /opt/okx-watchdog/okx-trading-bot/.env
+   ```
+
+   В `.env` укажите `OKX_MODE=DEMO`, правильный для **этого Demo-аккаунта** `OKX_REGION`, отдельный Demo API key/secret/passphrase с разрешением **Read only**, Telegram token/chat ID и `OKX_WATCHDOG_STATE_PATH=/var/lib/okx-watchdog/watchdog.sqlite3`. Для короткого цикла можно установить `OKX_TIMEOUT_SECONDS=3` и `OKX_MAX_ATTEMPTS=2`. Watchdog откажется запускаться на Ubuntu, если `.env` доступен группе или другим пользователям либо является символической ссылкой. Не включайте Trade/Withdraw, LIVE и реальные ключи. Значения секретов не передавайте в аргументах команд или сообщения. Программа не может по GET доказать набор прав выданного ключа: убедитесь в **Read only** в настройках OKX.
+5. Проверьте офлайн-тесты и установите **только новые** unit-файлы из `deploy/systemd`:
+
+   ```bash
+   cd /opt/okx-watchdog/okx-trading-bot
+   ./.venv/bin/python -m unittest discover -s tests -q
+   sudo install -o root -g root -m 644 deploy/systemd/okx-watchdog.service /etc/systemd/system/okx-watchdog.service
+   sudo install -o root -g root -m 644 deploy/systemd/okx-watchdog.timer /etc/systemd/system/okx-watchdog.timer
+   sudo systemd-analyze verify /etc/systemd/system/okx-watchdog.service /etc/systemd/system/okx-watchdog.timer
+   sudo systemctl daemon-reload
+   ```
+
+6. Запустите один пробный цикл, затем включите только новый таймер:
+
+   ```bash
+   sudo systemctl start okx-watchdog.service
+   sudo journalctl -u okx-watchdog.service -n 30 --no-pager
+   sudo systemctl enable --now okx-watchdog.timer
+   systemctl list-timers --all okx-watchdog.timer
+   ```
+
+   `SUSPICIOUS`/`API_UNAVAILABLE` дают ненулевой код, поэтому пробный `systemctl start` может показать failed; сначала прочитайте отчёт. Таймер запускает один процесс каждые пять минут, а не бесконечный цикл. Для остановки **только этого** мониторинга: `sudo systemctl disable --now okx-watchdog.timer`.
+
+Unit работает под непривилегированным пользователем, с `UMask=0077`, приватным `StateDirectory` (`0700`), правами файла SQLite `0600`, read-only кодом, лимитами памяти/CPU/задач/времени и ограничением частоты записей в systemd journal. Он не меняет firewall, DNS, SSH или другие службы. Нужен исходящий HTTPS к региональному домену OKX и Telegram; при недоступности региона другой домен автоматически не выбирается. Помимо Telegram `sendMessage`, Watchdog использует только GET; торговых POST, BUY/SELL и переводов нет.
+
+Существующий бюджет 5 000 виртуальных USDT, риск 0,5%/2%, стоп 1%, тейк 2% и база UTC не менялись. Торговых POST, переводов, LIVE и продажи внешнего BTC нет.

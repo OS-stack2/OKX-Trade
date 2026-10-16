@@ -62,6 +62,10 @@ class TelegramAlerter:
             "MISMATCH": "OKX Demo BTC-USDT: данные биржи и SQLite расходятся. HALTED сохранён. Требуется ручная сверка.",
             "CONNECTION_LOST": "OKX Demo BTC-USDT: связь с Demo API потеряна. HALTED сохранён; исполнения неизвестны.",
             "CONNECTION_RESTORED": "OKX Demo BTC-USDT: связь восстановлена. HALTED остаётся; проверьте позицию и защиту вручную.",
+            "WATCHDOG_API_DOWN": "OKX Watchdog Demo BTC-USDT: публичный или Demo GET недоступен. Состояние счёта неизвестно; проверьте сервис и OKX вручную.",
+            "WATCHDOG_RESTORED": "OKX Watchdog Demo BTC-USDT: связь с публичным и Demo GET восстановлена. Принадлежность BTC и защита всё ещё неизвестны.",
+            "WATCHDOG_CHANGED": "OKX Watchdog Demo BTC-USDT: баланс или список ордеров изменился. Проверьте виртуальный счёт вручную; защита не подтверждена.",
+            "WATCHDOG_SUSPICIOUS": "OKX Watchdog Demo BTC-USDT: обнаружено подозрительное расхождение баланса или ордеров. Проверьте виртуальный счёт вручную; защита не подтверждена.",
         }
         if event not in messages:
             return False

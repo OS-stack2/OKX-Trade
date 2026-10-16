@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OKX Demo observation watchdog every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+AccuracySec=30s
+Unit=okx-watchdog.service
+
+[Install]
+WantedBy=timers.target
