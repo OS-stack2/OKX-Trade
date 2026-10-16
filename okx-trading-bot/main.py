@@ -14,6 +14,7 @@ from bot.okx_client import OkxClient, OkxError
 from bot.order_preview import preview_demo_buy
 from bot.protection_capabilities import inspect_protection_capabilities
 from bot.protection_simulator import SimulationConfig, SimulationError, parse_price_path, run_sample_scenarios
+from bot.recovery_manager import RecoveryManager
 from bot.risk_manager import RiskManager
 from bot.reconcile import DemoReconciler
 from bot.budget_setup import BudgetInitializer
@@ -36,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--order-preview", action="store_true", help="Read-only, blocked Demo LIMIT BUY preview")
     commands.add_argument("--protection-capabilities", action="store_true", help="GET-only Demo attached TP/SL capability inventory")
     commands.add_argument("--protection-simulate", action="store_true", help="Offline BUY/SL/TP lifecycle scenarios in temporary SQLite")
+    commands.add_argument("--recovery-check", action="store_true", help="Read-only Demo GET recovery and durable emergency halt")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     args = parser.parse_args(argv)
@@ -43,6 +45,22 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--budget-token используется только с --confirm-budget")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+
+    if args.recovery_check:
+        report = RecoveryManager(engine=ExecutionEngine()).check_once()
+        print(f"OKX Demo BTC-USDT SPOT — аварийная сверка: {report.status}")
+        print(f"HALTED в SQLite: {'да' if report.halted else 'нет'}")
+        print(f"BTC бота по подтверждённым GET fills: {report.bot_btc if report.bot_btc is not None else 'неизвестно'}")
+        print(f"Внешний BTC: {report.external_btc if report.external_btc is not None else 'неизвестно'}; продажа запрещена")
+        print(f"Подтверждённый SL: {report.confirmed_sl_btc if report.confirmed_sl_btc is not None else 'неизвестно'} BTC")
+        print(f"BTC без подтверждённого SL: {report.uncovered_btc if report.uncovered_btc is not None else 'неизвестно'}")
+        print(f"Открытых ордеров: {report.open_order_count if report.open_order_count is not None else 'неизвестно'}")
+        for reason in report.reasons:
+            print(f"Причина BLOCKED: {reason}")
+        print(f"Действие владельца: {report.owner_action}")
+        print(f"Telegram: {report.notification}")
+        print("Торговые запросы и снятие HALTED не выполнялись")
+        return 1
 
     if args.protection_simulate:
         try:

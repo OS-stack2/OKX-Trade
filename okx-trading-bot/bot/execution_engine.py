@@ -269,6 +269,22 @@ class ExecutionEngine:
         except (sqlite3.Error, OSError, JournalError, ExecutionError, TypeError, ValueError):
             return ExecutionDiagnostic(True, "Журнал исполнения недоступен или повреждён", True, ())
 
+    def halt_reason_code(self) -> str | None:
+        """Read durable halt reason without creating or changing the journal."""
+        if not self.path.is_file():
+            return None
+        try:
+            with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro",
+                                         uri=True, timeout=3)) as db:
+                row = db.execute("SELECT halted,reason_code FROM execution_control WHERE id=1").fetchone()
+                if row is None:
+                    return None
+                if row[0] not in (0, 1) or not isinstance(row[1], str):
+                    raise ExecutionError("Аварийное состояние повреждено")
+                return row[1] if row[0] else None
+        except sqlite3.Error as exc:
+            raise ExecutionError("Не удалось прочитать аварийное состояние") from exc
+
     def _risk_preview(
         self, report: ReconcileReport, instrument: InstrumentLimits,
         costs: ExecutionCosts, entry_price: Decimal, now: datetime,

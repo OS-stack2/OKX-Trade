@@ -1,0 +1,70 @@
+"""Optional owner alerts; delivery never controls the local safety state.
+
+Only a local .env may supply credentials. No token, URL or transport exception
+is returned to callers or written to the journal.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+from pathlib import Path
+import re
+from typing import Callable
+from urllib.request import Request, urlopen
+
+from config import ConfigError, _read_env_file
+
+
+def _post(request: Request, timeout: float) -> object:
+    with urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+@dataclass(frozen=True, repr=False)
+class TelegramAlerter:
+    token: str = field(repr=False)
+    chat_id: str = field(repr=False)
+    transport: Callable[[Request, float], object] = field(default=_post, repr=False)
+
+    @classmethod
+    def from_env_file(cls, path: Path | None = None) -> TelegramAlerter | None:
+        env_path = path or Path(__file__).resolve().parents[1] / ".env"
+        if not env_path.is_file():
+            return None
+        try:
+            values = _read_env_file(env_path)
+        except (ConfigError, OSError, UnicodeError):
+            return None
+        if values.get("OKX_MODE") != "DEMO":
+            return None
+        token = values.get("OKX_TELEGRAM_BOT_TOKEN", "")
+        chat = values.get("OKX_TELEGRAM_CHAT_ID", "")
+        if not token and not chat:
+            return None
+        if not re.fullmatch(r"[0-9]{5,20}:[A-Za-z0-9_-]{20,}", token):
+            return None
+        if not re.fullmatch(r"-?[0-9]{1,20}", chat):
+            return None
+        return cls(token, chat)
+
+    def notify(self, event: str) -> bool:
+        messages = {
+            "HALTED": "OKX Demo BTC-USDT: аварийная остановка сохранена. Новые сделки запрещены. Проверьте --recovery-check.",
+            "UNPROTECTED": "OKX Demo BTC-USDT: BTC бота без подтверждённого SL. HALTED сохранён. Требуется ручная проверка Demo-счёта.",
+            "MISMATCH": "OKX Demo BTC-USDT: данные биржи и SQLite расходятся. HALTED сохранён. Требуется ручная сверка.",
+            "CONNECTION_LOST": "OKX Demo BTC-USDT: связь с Demo API потеряна. HALTED сохранён; исполнения неизвестны.",
+            "CONNECTION_RESTORED": "OKX Demo BTC-USDT: связь восстановлена. HALTED остаётся; проверьте позицию и защиту вручную.",
+        }
+        if event not in messages:
+            return False
+        body = json.dumps({"chat_id": self.chat_id, "text": messages[event]}, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"https://api.telegram.org/bot{self.token}/sendMessage", data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            response = self.transport(request, 5.0)
+            return isinstance(response, dict) and response.get("ok") is True
+        except Exception:
+            return False
