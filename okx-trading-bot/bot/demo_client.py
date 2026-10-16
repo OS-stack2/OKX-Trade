@@ -26,6 +26,14 @@ class DemoError(Exception):
     """Safe, credential-free error for a Demo account check."""
 
 
+class DemoApiCodeError(DemoError):
+    """OKX answered with a definite non-zero business code."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True, repr=False)
 class DemoCredentials:
     api_key: str = field(repr=False)
@@ -136,6 +144,7 @@ class DemoClient:
     _ALGO_INFO = "/api/v5/trade/order-algo"
     _ALLOWED_PATHS = frozenset({_BALANCE, _PENDING, _FILLS, _TRADE_FEE,
                                 _ORDER_INFO, _ORDER_FILLS, _ALGO_PENDING, _ALGO_INFO})
+    _CREDENTIAL_NAMES = ("OKX_DEMO_API_KEY", "OKX_DEMO_API_SECRET", "OKX_DEMO_PASSPHRASE")
 
     def __init__(
         self,
@@ -173,12 +182,17 @@ class DemoClient:
             config = Config.from_environment(path, environ={})
         except (OSError, UnicodeError) as exc:
             raise ConfigError("Не удалось прочитать локальный .env") from exc
+        key_name, secret_name, passphrase_name = cls._credential_names(values)
         credentials = DemoCredentials(
-            values.get("OKX_DEMO_API_KEY", ""),
-            values.get("OKX_DEMO_API_SECRET", ""),
-            values.get("OKX_DEMO_PASSPHRASE", ""),
+            values.get(key_name, ""),
+            values.get(secret_name, ""),
+            values.get(passphrase_name, ""),
         )
         return cls(config, credentials)
+
+    @classmethod
+    def _credential_names(cls, values: dict[str, str]) -> tuple[str, str, str]:
+        return cls._CREDENTIAL_NAMES
 
     @property
     def config(self) -> Config:
@@ -191,6 +205,22 @@ class DemoClient:
             raise DemoError("Не удалось получить время UTC для подписи Demo-запроса")
         return now.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
+    def _signed_headers(self, method: str, request_path: str, body: str = "") -> dict[str, str]:
+        timestamp = self._timestamp()
+        prehash = timestamp + method + request_path + body
+        signature = base64.b64encode(
+            hmac.new(self._credentials.secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+        ).decode("ascii")
+        return {
+            "Accept": "application/json",
+            "User-Agent": "okx-trading-bot/0.1",
+            "OK-ACCESS-KEY": self._credentials.api_key,
+            "OK-ACCESS-SIGN": signature,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": self._credentials.passphrase,
+            **demo_request_headers(self._config),
+        }
+
     def _get(self, path: str, params: dict[str, str]) -> list[dict[str, Any]]:
         if path not in self._ALLOWED_PATHS:
             raise DemoError("Запрещённый приватный endpoint")
@@ -198,21 +228,7 @@ class DemoClient:
         request_path = path + (f"?{query}" if query else "")
         url = self._config.base_url + request_path
         for attempt in range(self._config.max_attempts):
-            timestamp = self._timestamp()
-            prehash = timestamp + "GET" + request_path  # GET body is empty.
-            signature = base64.b64encode(
-                hmac.new(self._credentials.secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
-            ).decode("ascii")
-            headers = {
-                "Accept": "application/json",
-                "User-Agent": "okx-trading-bot/0.1",
-                "OK-ACCESS-KEY": self._credentials.api_key,
-                "OK-ACCESS-SIGN": signature,
-                "OK-ACCESS-TIMESTAMP": timestamp,
-                "OK-ACCESS-PASSPHRASE": self._credentials.passphrase,
-                **demo_request_headers(self._config),
-            }
-            request = Request(url, headers=headers, method="GET")
+            request = Request(url, headers=self._signed_headers("GET", request_path), method="GET")
             try:
                 payload = self._transport(request, self._config.timeout_seconds)
             except HTTPError as exc:
@@ -239,7 +255,7 @@ class DemoClient:
                 if code == "50102":
                     raise DemoError("Неверное время запроса Demo API; синхронизируйте часы Windows")
                 if code != "50011":
-                    raise DemoError(f"Demo API отклонил запрос (код {code}); проверьте Demo-ключи и права")
+                    raise DemoApiCodeError(f"Demo API отклонил запрос (код {code}); проверьте Demo-ключи и права", code)
                 problem = "Demo API ограничил частоту запросов (50011)"
             if attempt + 1 == self._config.max_attempts:
                 raise DemoError(f"{problem}; попытки исчерпаны")

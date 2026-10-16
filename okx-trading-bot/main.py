@@ -33,7 +33,10 @@ from bot.growth_research import (ResearchConfig, ResearchError, ResearchReport,
                                  load_candles_csv, okx_taker_debit_rate, research)
 from bot.history_download import HistoryError, RESEARCH_BARS, download_history, save_history_csv
 from bot.market_data import Candle, SpotInstrument
+from bot.demo_trader import (DemoTradeClient, DemoTrader, TraderError, TraderSettings, TraderStore,
+                             abandon_position, resume, trader_state_path_from_env)
 from config import Config, ConfigError
+import sqlite3
 
 
 def _print_research_report(report: ResearchReport, historical_candles: tuple[Candle, ...],
@@ -64,6 +67,61 @@ def _print_research_report(report: ResearchReport, historical_candles: tuple[Can
         print(f"ПРЕДУПРЕЖДЕНИЕ: {warning}")
 
 
+def _demo_trader_command(args: argparse.Namespace) -> int:
+    try:
+        store = TraderStore(trader_state_path_from_env())
+        now = datetime.now(timezone.utc)
+        if args.demo_trade_resume is not None:
+            if resume(store, args.demo_trade_resume, now):
+                print("Demo-трейдер: HALT снят; следующий цикл сверит позицию с OKX")
+                return 0
+            print("Demo-трейдер: HALT не снят — неверная фраза или остановки нет", file=sys.stderr)
+            return 1
+        if args.demo_trade_abandon is not None:
+            if abandon_position(store, args.demo_trade_abandon, now):
+                print("Demo-трейдер: активная позиция больше не отслеживается")
+                return 0
+            print("Demo-трейдер: неверная фраза или нет активной позиции", file=sys.stderr)
+            return 1
+        if args.demo_trade_status:
+            halted = store.get_meta("halted")
+            position = store.active_position()
+            closed = store.closed_positions()
+            settings_budget = TraderSettings().budget_usdt
+            pnl = sum((p.pnl_usdt or Decimal(0)) for p in closed)
+            wins = sum(1 for p in closed if (p.pnl_usdt or 0) > 0)
+            print(f"Demo-трейдер: {'HALTED ' + halted if halted else 'работает'}")
+            print(f"Последняя обработанная свеча: {store.get_meta('last_candle') or 'нет'}")
+            if position is None:
+                print("Позиция: нет")
+            else:
+                print(f"Позиция: {position.state} {position.net_btc or position.planned_btc} BTC, "
+                      f"вход {position.entry_price}, SL {position.stop_price}, TP {position.take_price}")
+            print(f"Закрыто сделок: {len(closed)}, прибыльных {wins}; PnL {pnl:+.2f} USDT")
+            for item in closed[-10:]:
+                print(f"  {item.closed_at} {item.exit_reason}: {item.net_btc} BTC, вход {item.entry_price}, "
+                      f"PnL {item.pnl_usdt:+.2f}")
+            return 1 if halted else 0
+        settings = TraderSettings.from_env_file()
+        client = DemoTradeClient.from_env_file()
+        alerter = TelegramAlerter.from_env_file()
+        public = OkxClient(client.config)
+        trader = DemoTrader(client=client, store=store, settings=settings,
+                            market_provider=lambda: get_market_snapshot(public),
+                            notifier=alerter.send_text if alerter is not None else None)
+        report = trader.run_once()
+    except (ConfigError, TraderError, OSError, sqlite3.Error) as exc:
+        print(f"Demo-трейдер: BLOCK — {exc}", file=sys.stderr)
+        return 1
+    except OkxError as exc:
+        print(f"Demo-трейдер: публичные данные OKX недоступны — {exc}", file=sys.stderr)
+        return 1
+    print(f"OKX Demo-трейдер BTC-USDT: {report.status}")
+    for line in report.lines:
+        print(line)
+    return report.exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only OKX BTC-USDT market data and EMA signal")
     commands = parser.add_mutually_exclusive_group(required=True)
@@ -89,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--health-once", action="store_true", help="Check Watchdog observation freshness without OKX requests")
     commands.add_argument("--growth-research", metavar="CSV", help="Offline 15m EMA strategy comparison from a local CSV")
     commands.add_argument("--download-history", action="store_true", help="Public GET-only BTC-USDT 15m history to CSV")
+    commands.add_argument("--demo-trade-once", action="store_true", help="One Demo trading cycle: reconcile, signal, trade")
+    commands.add_argument("--demo-trade-status", action="store_true", help="Show the Demo trader journal without OKX requests")
+    commands.add_argument("--demo-trade-resume", metavar="PHRASE", help="Clear a Demo trader HALT after manual review")
+    commands.add_argument("--demo-trade-abandon", metavar="PHRASE", help="Stop tracking a position closed manually on OKX")
     parser.add_argument("--history-bars", type=int, default=RESEARCH_BARS, metavar="COUNT", help="Closed candles to download (default 17280)")
     parser.add_argument("--history-output", type=Path, default=Path("data/btc_usdt_15m.csv"), metavar="CSV")
     parser.add_argument("--overwrite-history", action="store_true", help="Explicitly replace an existing history CSV")
@@ -292,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Telegram: {report.notification}")
         print("Свежесть GET не подтверждает защиту позиции; торговля отключена")
         return report.exit_code
+
+    if args.demo_trade_once or args.demo_trade_status or args.demo_trade_resume is not None \
+            or args.demo_trade_abandon is not None:
+        return _demo_trader_command(args)
 
     if args.watchdog_once:
         try:

@@ -79,8 +79,17 @@ class TelegramAlerter:
                 if self._test_attempted:
                     return False
                 object.__setattr__(self, "_test_attempted", True)
+        return self._send(messages[event])
+
+    def send_text(self, text: str) -> bool:
+        """Free-form owner message built by the bot itself (never from API text)."""
+        if not isinstance(text, str) or not text.strip() or len(text) > 3500:
+            return False
+        return self._send(text)
+
+    def _send(self, text: str) -> bool:
         try:
-            body = json.dumps({"chat_id": self.chat_id, "text": messages[event]},
+            body = json.dumps({"chat_id": self.chat_id, "text": text},
                               ensure_ascii=False).encode("utf-8")
             request = Request(
                 f"https://api.telegram.org/bot{self.token}/sendMessage", data=body,
