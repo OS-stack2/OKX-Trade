@@ -382,3 +382,45 @@ sudo -u okx-watchdog ./.venv/bin/python main.py --first-demo-trade
 В отчёте **SQLite: BLOCKED** означает сохранённый `HALTED` или любое прежнее намерение: `--first-demo-trade` специально останавливается даже при ранее отклонённом намерении. Выводятся сохранённый код причины и UTC-время аварийной остановки, последнее намерение, его состояние, время свечи, создания и обновления, локально учтённый fill и признаки неопределённого BUY. **SQLite: CLEAR** означает только отсутствие локальной блокировки; **UNKNOWN** означает, что файл, схема или данные не прошли безопасную проверку. Неизвестный/повреждённый текст причины из базы не печатается: его нужно сверять вручную. Отдельная строка **Защита частичных BUY: UNVERIFIED** перечисляет недостающие доказательства по каждому fill, Algo ID, размеру и связи SL/TP, атомарности и взаимоисключению. Поэтому даже при `SQLite: CLEAR` общий результат остаётся `BLOCK` с кодом выхода `1`. Никакой из этих статусов не даёт права на отправку ордера.
 
 Если команда показывает `HALTED`, не удаляйте файл, намерения или строки вручную. Сверьте конкретный `clientOrderId`, фактические fills и комиссии, SL/TP Algo ID и виртуальный BTC на OKX Demo с владельцем стратегии. Эта команда лишь объясняет блокировку; процедуры снятия `HALTED` в CLI нет. При запуске на Watchdog-сервере не копируйте туда рабочую торговую SQLite Windows: отсутствие локальной торговой базы даст `UNKNOWN`, что ожидаемо для отдельного сервера наблюдения. Watchdog, Health Monitor и их systemd-таймеры не меняются.
+
+## Новая торговая SQLite на Ubuntu (этап 4B.2B-2J)
+
+Эти команды предназначены **только для новой базы** `data/dry_run_journal.sqlite3` на отдельном Ubuntu-сервере. `--sqlite-prepare` только читает путь, права каталога, схему, прошлые намерения, `HALTED`, бюджет и состояние Risk Manager. Если файла нет, команда выдаёт токен текущего пятиминутного окна UTC. `--sqlite-init` требует точную фразу и этот токен, ещё раз проверяет состояние, строит журнал существующим `DecisionJournal` во временном файле с правами `0600` и публикует его атомарно без перезаписи существующего файла. Создаётся одна служебная запись `BLOCK`, **не торговое намерение**. Существующая, повреждённая или аварийная SQLite никогда не заменяется. Если после сбоя остался `.sqlite-bootstrap-*.sqlite3`, новая попытка блокируется до ручной проверки; не удаляйте его вслепую.
+
+На Ubuntu проверьте чистоту локального Git и выполните обновление только если нет отслеживаемых изменений. Из `/opt/okx-watchdog/repo/okx-trading-bot`:
+
+```bash
+cd /opt/okx-watchdog/repo/okx-trading-bot
+git status --short
+git pull --ff-only origin main
+./.venv/bin/python -m unittest discover -s tests -q
+stat -c '%U:%G %a %n' data
+sudo -u okx-watchdog ./.venv/bin/python main.py --sqlite-prepare
+```
+
+Если `data` не доступна пользователю `okx-watchdog` для записи и **в ней действительно только `.gitkeep`**, вручную выдайте этому пользователю права **только на каталог `data`**, затем повторите `--sqlite-prepare`:
+
+```bash
+sudo chown okx-watchdog:okx-watchdog /opt/okx-watchdog/repo/okx-trading-bot/data
+sudo chmod 700 /opt/okx-watchdog/repo/okx-trading-bot/data
+sudo -u okx-watchdog ./.venv/bin/python main.py --sqlite-prepare
+```
+
+Если статус `MISSING`, число намерений `0`, `HALTED: нет`, бюджет `UNCONFIRMED` и Risk Manager `UNINITIALIZED`, скопируйте **токен именно из этого вывода** и вручную выполните:
+
+```bash
+sudo -u okx-watchdog ./.venv/bin/python main.py --sqlite-init "INITIALIZE NEW OKX DEMO SQLITE" --sqlite-token ВАШ_ТОКЕН
+sudo -u okx-watchdog ./.venv/bin/python main.py --sqlite-prepare
+sudo -u okx-watchdog ./.venv/bin/python main.py --execution-diagnose
+```
+
+После создания SQLite бюджет по-прежнему `UNCONFIRMED`, дневная база Risk Manager не задана. Если хотите **отдельно** подтвердить 5 000 виртуальных USDT, используйте существующий Demo Read-only механизм: сначала проверьте виртуальный USDT, внешний 1 BTC, комиссию и ограничения в `--budget-preview`, затем вручную используйте **новый токен именно из этого просмотра**:
+
+```bash
+sudo -u okx-watchdog ./.venv/bin/python main.py --budget-preview
+sudo -u okx-watchdog ./.venv/bin/python main.py --confirm-budget "CONFIRM DEMO BTC-USDT 5000 USDT" --budget-token ВАШ_НОВЫЙ_ТОКЕН_БЮДЖЕТА
+```
+
+Токен SQLite к бюджету не подходит. Внешний BTC не включается в капитал стратегии. При неизвестных балансах, правах API или старом состоянии Risk Manager подтверждение блокируется.
+
+Ни одна из этих команд не отправляет торговый POST, не создаёт BUY/SELL и не снимает `HALTED`. `--execution-diagnose` может вывести `SQLite: CLEAR`, но защита каждой частично исполненной покупки остаётся **UNVERIFIED**, первая Demo-сделка остаётся `BLOCK`. Команды не меняют Watchdog, Health Monitor или их systemd timers. Не копируйте рабочую SQLite Windows и не запускайте инициализацию от root.

@@ -9,6 +9,7 @@ from bot.demo_client import DemoClient, DemoError
 from bot.dry_run import DryRunOrchestrator
 from bot.execution_engine import ExecutionEngine
 from bot.execution_diagnostics import inspect_execution
+from bot.server_sqlite_setup import SQLITE_CONFIRMATION_PHRASE, ServerSqliteSetup, SqliteSetupError
 from bot.journal import DecisionJournal, JournalError
 from bot.market_data import get_market_snapshot
 from bot.okx_client import OkxClient, OkxError
@@ -40,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--confirm-budget", metavar="PHRASE", help="Confirm the allocation with the exact phrase")
     commands.add_argument("--execution-check", action="store_true", help="Offline inspection of local execution state")
     commands.add_argument("--execution-diagnose", action="store_true", help="Read-only explanation of SQLite and protection blocks")
+    commands.add_argument("--sqlite-prepare", action="store_true", help="Read-only preflight for a new server trading SQLite")
+    commands.add_argument("--sqlite-init", metavar="PHRASE", help="Create a new Demo SQLite after explicit confirmation")
     commands.add_argument("--order-preview", action="store_true", help="Read-only, blocked Demo LIMIT BUY preview")
     commands.add_argument("--first-demo-trade", action="store_true", help="One controlled Demo trade preflight; execution remains blocked")
     commands.add_argument("--protection-capabilities", action="store_true", help="GET-only Demo attached TP/SL capability inventory")
@@ -49,15 +52,46 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--watchdog-once", action="store_true", help="One Demo GET observation using a separate Watchdog journal")
     commands.add_argument("--health-once", action="store_true", help="Check Watchdog observation freshness without OKX requests")
     parser.add_argument("--budget-token", metavar="TOKEN", help="Fresh token from --budget-preview")
+    parser.add_argument("--sqlite-token", metavar="TOKEN", help="Fresh token from --sqlite-prepare")
     parser.add_argument("--first-demo-confirm", metavar="PHRASE", help="Explicit acknowledgement of the non-executing first Demo trade review")
     parser.add_argument("--sim-price-path", metavar="PRICES", help="Comma-separated hypothetical BTC prices, e.g. 80000,79200,78400")
     args = parser.parse_args(argv)
     if args.budget_token and args.confirm_budget is None:
         parser.error("--budget-token используется только с --confirm-budget")
+    if args.sqlite_token and args.sqlite_init is None:
+        parser.error("--sqlite-token используется только с --sqlite-init")
     if args.first_demo_confirm is not None and not args.first_demo_trade:
         parser.error("--first-demo-confirm используется только с --first-demo-trade")
     if args.sim_price_path is not None and not args.protection_simulate:
         parser.error("--sim-price-path используется только с --protection-simulate")
+
+    if args.sqlite_prepare or args.sqlite_init is not None:
+        setup = ServerSqliteSetup()
+        if args.sqlite_init is not None:
+            try:
+                report = setup.initialize(args.sqlite_init, args.sqlite_token or "")
+            except SqliteSetupError:
+                print("SQLite: BLOCKED — подтверждение или состояние пути не проверены; "
+                      "существующая база не перезаписывалась. Повторите --sqlite-prepare", file=sys.stderr)
+                return 1
+            print("Новая локальная Demo SQLite создана однократно; торговля отключена")
+        else:
+            report = setup.preview()
+        print(f"Подготовка Demo SQLite: {report.status}")
+        print(f"Путь: {report.path}")
+        print(f"Права каталога: {report.directory_mode or 'неизвестны'}; "
+              f"права SQLite: {report.file_mode or 'файл отсутствует'}")
+        print(f"Схема: {report.schema}; намерений: "
+              f"{report.intent_count if report.intent_count is not None else 'неизвестно'}; "
+              f"HALTED: {'неизвестно' if report.halted is None else 'да' if report.halted else 'нет'}")
+        print(f"Бюджет: {report.budget}; Risk Manager: {report.risk}")
+        print(f"Причина: {report.reason}")
+        if report.token is not None and args.sqlite_prepare:
+            print("Для однократной подготовки выполните вручную:")
+            print(f'./.venv/bin/python main.py --sqlite-init "{SQLITE_CONFIRMATION_PHRASE}" --sqlite-token {report.token}')
+        print("Это не подтверждает бюджет 5000 Demo USDT и не разрешает торговлю; "
+              "SL/TP каждой частичной покупки остаются UNVERIFIED")
+        return 0 if report.status in ("MISSING", "EXISTS") else 1
 
     if args.first_demo_trade:
         if args.first_demo_confirm is not None and args.first_demo_confirm != REVIEW_PHRASE:
