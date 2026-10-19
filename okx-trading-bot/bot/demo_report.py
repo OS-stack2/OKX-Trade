@@ -48,6 +48,12 @@ def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decima
                   f"  PnL всего {sum((p.pnl_usdt or Decimal(0)) for p in closed_news):+.2f} USDT"]
         if reasons_news:
             lines.append("  выходы: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons_news.items())))
+        if news is not None:
+            from bot.news_trader import AnalystCases, analyst_summary
+            pnl_by_id = {p.id: p.pnl_usdt for p in closed_news}
+            lines.append("  аналитик:")
+            lines += ["  " + line for line in analyst_summary(AnalystCases(news_trader.path).all(),
+                                                             pnl_by_id, news.path)]
 
     book = trend.book(trend_budget)
     trades = trend.trades()

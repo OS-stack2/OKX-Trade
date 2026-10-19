@@ -108,6 +108,27 @@ class OkxClient:
             raise ValueError("minute candles limit must be 1..300")
         return self._get("/api/v5/market/candles", {"instId": "BTC-USDT", "bar": "1m", "limit": str(limit)})
 
+    def get_hourly_candles(self, limit: int = 168) -> list[Any]:
+        """Last 1H candles (newest first); a week at the default limit."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 300:
+            raise ValueError("hourly candles limit must be 1..300")
+        return self._get("/api/v5/market/candles", {"instId": "BTC-USDT", "bar": "1H", "limit": str(limit)})
+
+    def get_funding_rate(self) -> list[Any]:
+        return self._get("/api/v5/public/funding-rate", {"instId": "BTC-USDT-SWAP"})
+
+    def get_open_interest_history(self) -> list[Any]:
+        """Hourly [ts, open interest USD, volume USD] for BTC contracts, newest first."""
+        return self._get("/api/v5/rubik/stat/contracts/open-interest-volume", {"ccy": "BTC", "period": "1H"})
+
+    def get_long_short_ratio(self) -> list[Any]:
+        """Hourly [ts, long/short account ratio] for BTC contracts, newest first."""
+        return self._get("/api/v5/rubik/stat/contracts/long-short-account-ratio", {"ccy": "BTC", "period": "1H"})
+
+    def get_taker_volume(self) -> list[Any]:
+        """Hourly [ts, taker sell volume, taker buy volume] on BTC spot, newest first."""
+        return self._get("/api/v5/rubik/stat/taker-volume", {"ccy": "BTC", "instType": "SPOT", "period": "1H"})
+
     def get_ticker(self) -> list[Any]:
         return self._get("/api/v5/market/ticker", {"instId": "BTC-USDT"})
 

@@ -45,7 +45,10 @@ from bot.news_radar import (RSS_FEEDS, TELEGRAM_CHANNELS, DeepSeekClassifier, Ne
                             active_brake, news_state_path_from_env, paper_stats, run_forever)
 from bot.news_trader import (RESUME_PHRASE as NEWS_RESUME_PHRASE, NewsFeed, NewsTrader, NewsTraderSettings,
                              cached_market, news_trader_state_path_from_env, run_forever as news_run_forever)
+from bot.news_analyst import NewsAnalyst, build_context, price_before, recent_headlines
+from bot.news_trader import AnalystCases, analyst_summary
 from config import _read_env_file
+import json
 import logging
 from config import Config, ConfigError
 import sqlite3
@@ -171,6 +174,14 @@ def _news_trade_command(args: argparse.Namespace) -> int:
         print(f"Закрыто сделок: {len(closed)}; PnL {pnl:+.2f} USDT")
         for item in closed[-10:]:
             print(f"  {item.opened_at[:16]} → {item.exit_reason}: PnL {item.pnl_usdt:+.2f}")
+        print("Аналитик:")
+        for line in analyst_summary(AnalystCases(store.path).all(), {p.id: p.pnl_usdt for p in closed},
+                                    news_state_path_from_env()):
+            print(line)
+        for case in AnalystCases(store.path).all()[-5:]:
+            last = (json.loads(case["decisions"]) or [{}])[-1]
+            print(f"  {case['seen_at'][:16]} {case['state']}: «{case['summary'][:70]}» "
+                  f"{last.get('decision', '')} {last.get('confidence', '')}%")
         return 1 if halted else 0
     try:
         settings = NewsTraderSettings.from_env_file()
@@ -187,7 +198,20 @@ def _news_trade_command(args: argparse.Namespace) -> int:
             raise OkxError("ticker unavailable")
         return evidence.last_price
 
-    trader = NewsTrader(feed=NewsFeed(news_state_path_from_env(), store), news_settings=settings,
+    radar_path = news_state_path_from_env()
+    values = _read_env_file(Path(__file__).resolve().parent / ".env")
+    analyst = None
+    if values.get("OKX_NEWSTRADER_ANALYST", "1") == "1":
+        analyst = NewsAnalyst(values.get("OKX_DEEPSEEK_API_KEY", ""))
+
+    def context_for(case, now):
+        return build_context(public, price=float(price()),
+                             published_at=datetime.fromisoformat(case["published_at"]), now=now,
+                             price_before_news=price_before(radar_path, case["news_key"]),
+                             recent_news=recent_headlines(radar_path, now, case["news_key"]))
+
+    trader = NewsTrader(feed=NewsFeed(radar_path, store), news_settings=settings,
+                        analyst=analyst, context_builder=context_for,
                         client=client, store=store,
                         market_provider=cached_market(lambda: read_spot_instrument(public), price),
                         notifier=alerter.send_text if alerter is not None else None, brake=active_brake)
