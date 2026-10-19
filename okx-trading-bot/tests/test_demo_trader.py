@@ -34,6 +34,9 @@ class FakeOkx:
         self.fail_algo: str | None = None
         self.timeout_on: str | None = None
         self.reject_buy: str | None = None
+        self.resting: dict[str, dict] = {}     # post-only orders waiting on the book
+        self.fill_after_polls: int | None = None
+        self.fill_fraction = D("1")
 
     def __call__(self, request, timeout):
         parts = urlsplit(request.full_url)
@@ -57,11 +60,32 @@ class FakeOkx:
                 {"ccy": "USDT", "cashBal": str(self.usdt), "availBal": str(self.usdt)}]}])
         if method == "GET" and path == "/api/v5/account/trade-fee":
             return self.ok([{"maker": "-0.0008", "taker": "-0.001"}])
+        if method == "POST" and path == "/api/v5/trade/order" and body["ordType"] == "post_only":
+            if body["side"] == "buy" and self.reject_buy:
+                return {"code": "1", "msg": "", "data": [{"sCode": self.reject_buy, "sMsg": "x", "ordId": ""}]}
+            order_id = f"L{len(self.orders) + 1}"
+            self.orders[body["clOrdId"]] = {
+                "instId": "BTC-USDT", "ordId": order_id, "clOrdId": body["clOrdId"], "side": body["side"],
+                "state": "live", "accFillSz": "0", "avgPx": "", "fee": "0", "feeCcy": "", "ordType": "post_only"}
+            self.resting[body["clOrdId"]] = {"sz": D(body["sz"]), "px": D(body["px"]), "polls": 0}
+            return self.ok([{"ordId": order_id, "clOrdId": body["clOrdId"], "sCode": "0", "sMsg": ""}])
+        if method == "POST" and path == "/api/v5/trade/cancel-order":
+            order = self.orders[body["clOrdId"]]
+            if order["state"] not in ("live", "partially_filled"):
+                return {"code": "1", "msg": "", "data": [{"sCode": "51401", "sMsg": "done"}]}
+            order["state"] = "canceled"
+            self.resting.pop(body["clOrdId"], None)
+            return self.ok([{"clOrdId": body["clOrdId"], "sCode": "0", "sMsg": ""}])
         if method == "POST" and path == "/api/v5/trade/order":
             if body["side"] == "buy" and self.reject_buy:
                 return {"code": "1", "msg": "", "data": [{"sCode": self.reject_buy, "sMsg": "x", "ordId": ""}]}
             return self.ok([{"ordId": self._fill(body["clOrdId"], body["side"], D(body["sz"])),
                              "clOrdId": body["clOrdId"], "sCode": "0", "sMsg": ""}])
+        if method == "GET" and path == "/api/v5/trade/order" and q.get("clOrdId") in self.resting:
+            rest = self.resting[q["clOrdId"]]
+            rest["polls"] += 1
+            if self.fill_after_polls is not None and rest["polls"] >= self.fill_after_polls:
+                self._fill_resting(q["clOrdId"], rest["sz"] * self.fill_fraction)
         if method == "GET" and path == "/api/v5/trade/order":
             order = (self.orders.get(q["clOrdId"]) if "clOrdId" in q
                      else next((o for o in self.orders.values() if o["ordId"] == q["ordId"]), None))
@@ -99,6 +123,21 @@ class FakeOkx:
             "instId": "BTC-USDT", "ordId": order_id, "clOrdId": client_id, "side": side, "state": "filled",
             "accFillSz": str(size), "avgPx": str(self.price), "fee": str(fee), "feeCcy": ccy}
         return order_id
+
+    def _fill_resting(self, client_id: str, size: D) -> None:
+        rest = self.resting.pop(client_id)
+        order = self.orders[client_id]
+        px = rest["px"]
+        if order["side"] == "buy":
+            fee, ccy = -(size * D("0.0008")), "BTC"
+            self.usdt -= size * px
+            self.btc += size + fee
+        else:
+            fee, ccy = -(size * px * D("0.0008")), "USDT"
+            self.btc -= size
+            self.usdt += size * px + fee
+        order.update(accFillSz=str(size), avgPx=str(px), fee=str(fee), feeCcy=ccy,
+                     state="filled" if size == rest["sz"] else "partially_filled")
 
     def trigger(self, algo_id: str, side: str) -> None:
         algo = self.algos[algo_id]

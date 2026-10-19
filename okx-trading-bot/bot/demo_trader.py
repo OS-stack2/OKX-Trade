@@ -109,7 +109,8 @@ class DemoTradeClient(DemoClient):
     _PLACE_ORDER = "/api/v5/trade/order"
     _PLACE_ALGO = "/api/v5/trade/order-algo"
     _CANCEL_ALGOS = "/api/v5/trade/cancel-algos"
-    _POST_PATHS = frozenset({_PLACE_ORDER, _PLACE_ALGO, _CANCEL_ALGOS})
+    _CANCEL_ORDER = "/api/v5/trade/cancel-order"
+    _POST_PATHS = frozenset({_PLACE_ORDER, _PLACE_ALGO, _CANCEL_ALGOS, _CANCEL_ORDER})
     _CREDENTIAL_NAMES = ("OKX_DEMO_TRADE_API_KEY", "OKX_DEMO_TRADE_API_SECRET",
                          "OKX_DEMO_TRADE_PASSPHRASE")
 
@@ -162,6 +163,29 @@ class DemoTradeClient(DemoClient):
         if not isinstance(order_id, str) or not _EXCHANGE_ID.fullmatch(order_id):
             raise OrderUncertain("OKX не вернул ordId")
         return order_id
+
+    def place_post_only_order(self, *, client_order_id: str, side: str, size_btc: Decimal,
+                              price: Decimal) -> str:
+        """Maker-only limit order: OKX rejects it instead of letting it take liquidity."""
+        if (not _CLIENT_ID.fullmatch(client_order_id) or side not in ("buy", "sell")
+                or size_btc <= 0 or price <= 0):
+            raise DemoError("Некорректные параметры лимитного ордера")
+        row = self._post(self._PLACE_ORDER, {
+            "instId": INST_ID, "tdMode": "cash", "clOrdId": client_order_id, "side": side,
+            "ordType": "post_only", "sz": format(size_btc, "f"), "px": format(price, "f"),
+        })
+        order_id = row.get("ordId")
+        if not isinstance(order_id, str) or not _EXCHANGE_ID.fullmatch(order_id):
+            raise OrderUncertain("OKX не вернул ordId")
+        return order_id
+
+    def cancel_order(self, client_order_id: str) -> None:
+        try:
+            self._post(self._CANCEL_ORDER, {"instId": INST_ID, "clOrdId": client_order_id})
+        except DemoApiCodeError as exc:
+            # 51400/51401/51402: already filled, canceled or gone — the state check decides.
+            if exc.code not in ("51400", "51401", "51402"):
+                raise
 
     def get_order(self, client_order_id: str) -> OrderStatus | None:
         """Exact lookup by our clOrdId; None only when OKX says it does not exist."""

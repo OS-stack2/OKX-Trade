@@ -306,12 +306,19 @@ def _trend_command(args: argparse.Namespace) -> int:
             if snapshot.last_price is None:
                 raise OkxError("ticker unavailable")
             return snapshot.last_price
+        def best_quote() -> tuple[Decimal, Decimal]:
+            row = public.get_ticker()[0]
+            bid, ask = Decimal(row["bidPx"]), Decimal(row["askPx"])
+            if not (0 < bid < ask) or ask / bid > Decimal("1.01"):
+                raise OkxError("bid/ask unavailable or implausible")
+            return bid, ask
+
         trader = TrendTrader(client=client, store=store, settings=settings,
                              closes_provider=lambda: read_daily_closes(public),
                              instrument_provider=lambda: read_spot_instrument(public),
                              price_provider=price,
                              notifier=alerter.send_text if alerter is not None else None,
-                             brake=active_brake)
+                             brake=active_brake, quote_provider=best_quote)
         report = trader.run_once()
     except (ConfigError, OkxError, OSError, sqlite3.Error) as exc:
         print(f"Тренд-бот: BLOCK — {exc}", file=sys.stderr)

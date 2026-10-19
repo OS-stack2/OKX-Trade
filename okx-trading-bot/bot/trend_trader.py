@@ -36,6 +36,9 @@ LOOKBACKS = (20, 30, 40, 50, 60)
 DEFAULT_BUDGET_USDT = Decimal("100")
 DEFAULT_STATE_PATH = Path(__file__).resolve().parents[1] / "data" / "trend_trader.sqlite3"
 RESUME_PHRASE = "RESUME OKX DEMO TREND"
+LIMIT_WAIT_SECONDS = 180          # how long a maker order may rest per attempt
+LIMIT_POLL_SECONDS = 5
+MAX_LIMIT_ATTEMPTS = 3            # per day; then fall back to a market order
 ZERO = Decimal(0)
 
 
@@ -120,6 +123,11 @@ class TrendStore:
         return Book(Decimal(meta["usdt"]), Decimal(meta["btc"]), meta.get("last_day"),
                     meta.get("pending"), meta.get("halted"))
 
+    def meta_value(self, key: str) -> str | None:
+        with self._db() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return None if row is None else row["value"]
+
     def set(self, **values: str | Decimal | None) -> None:
         with self._db() as db:
             for key, value in values.items():
@@ -200,7 +208,8 @@ class TrendTrader:
                  notifier: Callable[[str], object] | None = None,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  sleeper: Callable[[float], None] = time.sleep,
-                 brake: Callable[[datetime], str | None] | None = None) -> None:
+                 brake: Callable[[datetime], str | None] | None = None,
+                 quote_provider: Callable[[], tuple[Decimal, Decimal]] | None = None) -> None:
         self.client = client
         self.store = store
         self.closes_provider = closes_provider
@@ -211,6 +220,7 @@ class TrendTrader:
         self.clock = clock
         self.sleep = sleeper
         self.brake = brake
+        self.quote_provider = quote_provider
 
     def _notify(self, text: str) -> None:
         if self.notifier is not None:
@@ -245,9 +255,13 @@ class TrendTrader:
                 if order is None:
                     self.store.set(pending=None)
                     lines.append("Незавершённый ордер не дошёл до OKX; запись снята")
-                elif not order.terminal:
-                    raise TraderError("Ордер ребалансировки не завершился")
                 else:
+                    if not order.terminal:
+                        # A resting maker order from an interrupted run: take it off the book.
+                        self.client.cancel_order(book.pending_client_id)
+                        order = self._wait(book.pending_client_id)
+                        if order is None or not order.terminal:
+                            raise TraderError("Ордер ребалансировки не удалось снять")
                     book = self.store.apply_fill(book=book, order=order, day=book.last_day or "",
                                                  target=Decimal(-1), now=self.clock())
                     lines.append("Учтено исполнение ордера, прерванного сбоем")
@@ -271,6 +285,10 @@ class TrendTrader:
                     return TrendReport(status, tuple(lines))
                 if status == "BRAKED":
                     return TrendReport("HOLD", tuple(lines))
+                if status == "PARTIAL":
+                    # Not marked as processed: the next hourly run continues with a fresh target.
+                    return TrendReport("REBALANCED" if any("КУПЛЕНО" in x or "ПРОДАНО" in x for x in lines)
+                                       else "HOLD", tuple(lines))
             self.store.set(last_day=day.isoformat())
             return TrendReport(status, tuple(lines))
         except TraderError as exc:
@@ -305,17 +323,42 @@ class TrendTrader:
             btc, _ = self.client.get_balances()
             if btc.available < size:
                 raise TraderError("На счёте меньше BTC, чем в книге бота")
+        attempts = self._limit_attempts(day)
+        limit_price = None
+        if self.quote_provider is not None and attempts < MAX_LIMIT_ATTEMPTS:
+            bid, ask = self.quote_provider()
+            limit_price = bid if side == "buy" else ask
+            if side == "buy":
+                size = _floor(min(delta_usdt, book.usdt * Decimal("0.995")) / limit_price, instrument.lot_size)
+            if size < instrument.min_size:
+                lines.append(f"Ребалансировка пропущена: {size} BTC меньше минимума {instrument.min_size}")
+                return "HOLD"
         client_id = "DT" + uuid4().hex[:30]
         self.store.set(pending=client_id)
         try:
-            self.client.place_market_order(client_order_id=client_id, side=side, size_btc=size)
+            if limit_price is None:
+                self.client.place_market_order(client_order_id=client_id, side=side, size_btc=size)
+            else:
+                self.store.set(limit_attempts=f"{day}:{attempts + 1}")
+                self.client.place_post_only_order(client_order_id=client_id, side=side,
+                                                  size_btc=size, price=limit_price)
         except DemoApiCodeError as exc:
             self.store.set(pending=None)
             lines.append(f"Ордер отклонён OKX (код {exc.code}); книга не изменена")
-            return "HOLD"
-        order = self._wait(client_id)
+            return "PARTIAL" if limit_price is not None else "HOLD"
+        if limit_price is None:
+            order = self._wait(client_id)
+        else:
+            lines.append(f"Лимитный {side} {size} BTC по {limit_price} (мейкер, попытка {attempts + 1} "
+                         f"из {MAX_LIMIT_ATTEMPTS})")
+            order = self._wait_resting(client_id)
         if order is None or not order.terminal:
             raise TraderError("Ордер ребалансировки не подтвердился вовремя")
+        complete = limit_price is None or order.filled_btc >= size
+        if order.filled_btc == 0:
+            self.store.set(pending=None)
+            lines.append("Лимитный ордер не исполнился за отведённое время и снят; повтор через час")
+            return "PARTIAL"
         book = self.store.apply_fill(book=book, order=order, day=day, target=target, now=self.clock())
         new_equity = book.usdt + book.btc * order.avg_price
         verb = "КУПЛЕНО" if side == "buy" else "ПРОДАНО"
@@ -324,7 +367,23 @@ class TrendTrader:
                 f"Капитал {new_equity:.2f} USDT; в BTC {new_equity / order.avg_price:.8f}.")
         lines.append(text)
         self._notify(text)
-        return "REBALANCED"
+        return "REBALANCED" if complete else "PARTIAL"
+
+    def _limit_attempts(self, day: str) -> int:
+        raw = self.store.meta_value("limit_attempts") or ""
+        stored_day, _, count = raw.partition(":")
+        return int(count) if stored_day == day and count.isdigit() else 0
+
+    def _wait_resting(self, client_id: str) -> OrderStatus | None:
+        """Let a maker order rest, then cancel what is left and return the final state."""
+        status = None
+        for _ in range(int(LIMIT_WAIT_SECONDS / LIMIT_POLL_SECONDS)):
+            status = self.client.get_order(client_id)
+            if status is not None and status.terminal:
+                return status
+            self.sleep(LIMIT_POLL_SECONDS)
+        self.client.cancel_order(client_id)
+        return self._wait(client_id)
 
 
 def resume(store: TrendStore, phrase: str) -> bool:

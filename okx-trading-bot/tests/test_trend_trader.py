@@ -119,3 +119,70 @@ class TrendTraderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LimitRebalanceTests(TrendTraderTests):
+    """All trend scenarios again, with maker orders that the fake book fills at once by default."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.okx.fill_after_polls = 1
+
+    def trader(self) -> TrendTrader:
+        trader = super().trader()
+        trader.quote_provider = lambda: (self.okx.price - D("0.1"), self.okx.price + D("0.1"))
+        return trader
+
+    def posts(self, kind: str) -> list:
+        return [c for c in self.okx.calls if c[0] == "POST" and c[1] == "/api/v5/trade/order"
+                and c[2]["ordType"] == kind]
+
+    def test_maker_order_at_bid_fills(self) -> None:
+        self.okx.fill_after_polls = 3
+        report = self.trader().run_once()
+        self.assertEqual(report.status, "REBALANCED", report.lines)
+        [order] = self.posts("post_only")
+        self.assertEqual(D(order[2]["px"]), D("99999.9"))
+        self.assertEqual(self.posts("market"), [])
+        [trade] = self.store.trades()
+        self.assertEqual(D(trade["fee"]), D(trade["btc"]) * D("0.0008"))
+        self.assertEqual(self.store.book(D("100")).last_day, self.series[-1].day.isoformat())
+
+    def test_unfilled_maker_orders_fall_back_to_market_after_three_tries(self) -> None:
+        self.okx.fill_after_polls = None
+        for attempt in range(1, 4):
+            report = self.trader().run_once()
+            self.assertEqual(report.status, "HOLD", report.lines)
+            self.assertIn(f"попытка {attempt} из 3", " ".join(report.lines))
+            self.assertIsNone(self.store.book(D("100")).last_day)   # day stays open
+            self.now += timedelta(hours=1)
+        self.assertEqual(self.trader().run_once().status, "REBALANCED")
+        self.assertEqual(len(self.posts("market")), 1)
+        self.assertEqual(self.okx.btc, D("1") + self.store.book(D("100")).btc)
+
+    def test_partial_fill_is_booked_and_continued(self) -> None:
+        self.okx.fill_after_polls = 1
+        self.okx.fill_fraction = D("0.5")
+        report = self.trader().run_once()
+        self.assertEqual(report.status, "REBALANCED", report.lines)
+        half = self.store.book(D("100"))
+        self.assertGreater(half.btc, D("0"))
+        self.assertIsNone(half.last_day)
+        self.okx.fill_fraction = D("1")
+        self.now += timedelta(hours=1)
+        self.trader().run_once()
+        book = self.store.book(D("100"))
+        self.assertGreater(book.btc * self.okx.price, D("98"))
+        self.assertIsNotNone(book.last_day)
+
+    def test_interrupted_run_cancels_resting_order_and_books_it(self) -> None:
+        self.okx.fill_after_polls = None
+        self.okx.timeout_on = "/api/v5/trade/order"
+        self.assertEqual(self.trader().run_once().status, "HALTED")
+        client_id = self.store.book(D("100")).pending_client_id
+        self.okx._fill_resting(client_id, self.okx.resting[client_id]["sz"] / 2)
+        self.assertTrue(resume(self.store, RESUME_PHRASE))
+        self.trader().run_once()
+        book = self.store.book(D("100"))
+        self.assertIsNone(book.pending_client_id)
+        self.assertEqual(self.okx.btc, D("1") + book.btc)
