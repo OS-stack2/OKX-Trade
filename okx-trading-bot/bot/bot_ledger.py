@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 
 from bot.demo_trader import trader_state_path_from_env
+from bot.news_trader import news_trader_state_path_from_env
 from bot.trend_trader import trend_state_path_from_env
 from config import _read_env_file
 
@@ -47,8 +48,11 @@ def read_bot_holdings(env_path: Path | None = None) -> BotHoldings | None:
         external = Decimal(values.get("OKX_WATCHDOG_EXTERNAL_BTC", str(DEFAULT_EXTERNAL_BTC)))
     except InvalidOperation:
         return None
-    trader = _rows(trader_state_path_from_env(env_path),
-                   "SELECT state, net_btc, algo_id FROM positions WHERE state IN ('OPENING','OPEN','CLOSING')")
+    active = "SELECT state, net_btc, algo_id FROM positions WHERE state IN ('OPENING','OPEN','CLOSING')"
+    trader = _rows(trader_state_path_from_env(env_path), active)
+    news = _rows(news_trader_state_path_from_env(env_path), active)
+    if trader is not None or news is not None:
+        trader = (trader or []) + (news or [])
     trend = _rows(trend_state_path_from_env(env_path), "SELECT key, value FROM meta")
     if trader is None and trend is None:
         return None

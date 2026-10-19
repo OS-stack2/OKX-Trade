@@ -32,6 +32,7 @@ BOTS = {
     "demo-trader": ("okx-demo-trader.timer", timedelta(minutes=30), "EMA Demo-трейдер"),
     "demo-trend": ("okx-demo-trend.timer", timedelta(hours=3), "Тренд-бот"),
     "news-radar": ("okx-news-radar.service", timedelta(minutes=10), "Новостной радар"),
+    "news-trader": ("okx-news-trader.service", timedelta(minutes=10), "Новостной Demo-бот"),
 }
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from bot.run_monitor import RunMonitor, check_stale
+from bot.run_monitor import BOTS, RunMonitor, check_stale
 
 
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
@@ -49,7 +49,7 @@ class RunMonitorTests(unittest.TestCase):
 
     def test_never_seen_bot_starts_the_clock_instead_of_alerting(self):
         self.assertEqual(check_stale(self.monitor, NOW, None, lambda _t: True), [])
-        self.assertEqual(len(check_stale(self.monitor, NOW + timedelta(hours=4), None, lambda _t: True)), 3)
+        self.assertEqual(len(check_stale(self.monitor, NOW + timedelta(hours=4), None, lambda _t: True)), len(BOTS))
 
 
 if __name__ == "__main__":

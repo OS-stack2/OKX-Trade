@@ -1,0 +1,35 @@
+[Unit]
+StartLimitIntervalSec=0
+Description=OKX Demo news trader: buys BTC on strong confirmed bullish news (Demo only)
+Wants=network-online.target
+After=network-online.target okx-news-radar.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+User=okx-watchdog
+Group=okx-watchdog
+WorkingDirectory=/opt/okx-watchdog/repo/okx-trading-bot
+ExecStart=/opt/okx-watchdog/repo/okx-trading-bot/.venv/bin/python /opt/okx-watchdog/repo/okx-trading-bot/main.py --news-trade
+UMask=0077
+StateDirectory=okx-watchdog
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/okx-watchdog
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=128M
+CPUQuota=20%
+TasksMax=8
+LogRateLimitIntervalSec=1h
+LogRateLimitBurst=60
+
+[Install]
+WantedBy=multi-user.target

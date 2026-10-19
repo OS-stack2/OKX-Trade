@@ -12,7 +12,7 @@ from bot.trend_trader import TrendStore
 
 def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decimal,
                  price: Decimal | None, now: datetime, final: bool = False,
-                 news: NewsStore | None = None) -> str:
+                 news: NewsStore | None = None, news_trader: TraderStore | None = None) -> str:
     since = now - timedelta(days=7)
     lines = ["ИТОГ 2 МЕСЯЦЕВ Demo-теста" if final else "Еженедельная сводка Demo-ботов",
              f"на {now:%Y-%m-%d %H:%M} UTC" + (f", BTC {price:.0f} USDT" if price else "")]
@@ -33,6 +33,21 @@ def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decima
         reasons[p.exit_reason or "?"] = reasons.get(p.exit_reason or "?", 0) + 1
     if reasons:
         lines.append("  выходы: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items())))
+
+    if news_trader is not None:
+        closed_news = news_trader.closed_positions()
+        news_week = [p for p in closed_news if p.closed_at and datetime.fromisoformat(p.closed_at) >= since]
+        halted_news = news_trader.get_meta("halted")
+        reasons_news: dict[str, int] = {}
+        for p in closed_news:
+            reasons_news[p.exit_reason or "?"] = reasons_news.get(p.exit_reason or "?", 0) + 1
+        lines += ["", "Новостной бот (покупки по сильным новостям):",
+                  f"  статус: {'HALTED — ' + halted_news if halted_news else 'работает'}",
+                  f"  сделок всего {len(closed_news)} (прибыльных "
+                  f"{sum(1 for p in closed_news if (p.pnl_usdt or 0) > 0)}), за неделю {len(news_week)}",
+                  f"  PnL всего {sum((p.pnl_usdt or Decimal(0)) for p in closed_news):+.2f} USDT"]
+        if reasons_news:
+            lines.append("  выходы: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons_news.items())))
 
     book = trend.book(trend_budget)
     trades = trend.trades()

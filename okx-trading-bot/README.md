@@ -617,3 +617,16 @@ sudo systemctl daemon-reload && sudo systemctl enable --now okx-news-radar.servi
 ```
 
 В `.env`: `OKX_DEEPSEEK_API_KEY=...`, `OKX_NEWS_STATE_PATH=/var/lib/okx-watchdog/news_radar.sqlite3`.
+
+## Новостной Demo-бот (этап 6.1)
+
+`--news-trade` — служба `okx-news-trader.service`, торгует **только на Demo**. Каждые 2 секунды смотрит базу радара: новость про BTC с направлением «рост», силой ≥ `OKX_NEWSTRADER_MIN_IMPACT` (2), подтверждённая и свежая (радар увидел её не больше 3 минут назад) → рыночная покупка на `OKX_NEWSTRADER_FRACTION` (20%) своей книги `OKX_NEWSTRADER_BUDGET_USDT` (1000 USDT). Защита — тот же биржевой OCO, что у EMA-бота (SL −1%, TP +2%); если OCO не сработал, позиция продаётся через `OKX_NEWSTRADER_HOLD_MINUTES` (30) минут. Одна позиция одновременно, новости во время открытой позиции не копятся. Тормоз радара блокирует и его покупки. Медвежьи новости не продаются (спот без шорта).
+
+Выполнение, сверка, `HALTED` и восстановление по `clOrdId` — общие с `DemoTrader`. Снять остановку: `--news-trade-resume "RESUME OKX DEMO NEWS TRADER"`. Журнал: `--news-trade-status`. Его BTC и OCO учитываются Watchdog; сбои — `bot.run_monitor`; итоги — в еженедельной сводке.
+
+```bash
+sudo install -o root -g root -m 644 deploy/systemd/okx-news-trader.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now okx-news-trader.service
+```
+
+В `.env`: `OKX_NEWSTRADER_ENABLED=1`, `OKX_NEWSTRADER_STATE_PATH=/var/lib/okx-watchdog/news_trader.sqlite3`.

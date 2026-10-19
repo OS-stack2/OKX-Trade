@@ -79,6 +79,15 @@ class WatchdogBotLedgerTests(unittest.TestCase):
         holdings = read_bot_holdings(env)
         self.assertEqual(holdings.btc, D("0.01099"))
         self.assertEqual(holdings.algo_ids, frozenset({"A9"}))
+        with env.open("a", encoding="utf-8") as handle:
+            handle.write(f"OKX_NEWSTRADER_STATE_PATH={self.root / 'n.sqlite3'}\n")
+        news = TraderStore(self.root / "n.sqlite3")
+        opened = news.create_opening(candle_closed_at=NOW, client_id="DT" + "c" * 30,
+                                     planned_btc=D("0.002"), now=NOW)
+        news.update(opened.id, state="OPEN", net_btc=D("0.002"), algo_id="N1")
+        holdings = read_bot_holdings(env)
+        self.assertEqual(holdings.btc, D("0.01299"))
+        self.assertEqual(holdings.algo_ids, frozenset({"A9", "N1"}))
         self.assertEqual(holdings.external_btc, D("1"))
 
 

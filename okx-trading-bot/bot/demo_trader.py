@@ -397,6 +397,8 @@ def trader_state_path_from_env(path: Path | None = None) -> Path:
 
 
 class DemoTrader:
+    CLOSE_REASON = "SIGNAL"    # exit reason for bot-initiated closes
+    RESUME_COMMAND = "--demo-trade-resume"
     def __init__(self, *, client: DemoTradeClient, store: TraderStore,
                  market_provider: Callable[[], MarketSnapshot], settings: TraderSettings = TraderSettings(),
                  notifier: Callable[[str], object] | None = None,
@@ -431,7 +433,7 @@ class DemoTrader:
         self.store.set_meta("halted", f"{now.isoformat()} {reason}")
         self.store.event(now, "HALT", reason)
         self._notify(f"АВАРИЙНАЯ ОСТАНОВКА. {reason}. Новые сделки запрещены до ручной проверки "
-                     f"и команды --demo-trade-resume.")
+                     f"и команды {self.RESUME_COMMAND}.")
         self._say(f"HALTED: {reason}")
         return CycleReport("HALTED", tuple(self._lines))
 
@@ -521,7 +523,7 @@ class DemoTrader:
             order = self.client.get_order(position.sell_client_id)
             if order is None or not order.terminal:
                 raise TraderError("Состояние продажи позиции неизвестно")
-            self._finish(position, order, "SIGNAL")
+            self._finish(position, order, self.CLOSE_REASON)
             return True
         # OPEN: check whether the OCO triggered.
         assert position.algo_id is not None
@@ -565,12 +567,10 @@ class DemoTrader:
         fee = abs(self.client.get_spot_fee_rates().taker)
         btc, usdt = self.client.get_balances()
         price = market.last_price
-        cost_rate = fee + self.settings.slippage
-        entry_unit = price * (1 + cost_rate)
-        stop_unit = price * (1 - risk.stop_loss_pct) * (1 - cost_rate)
+        entry_unit = price * (1 + fee + self.settings.slippage)
         equity = self.equity()
-        risk_budget = min(equity * risk.risk_per_trade, loss_limit + realized)
-        quantity = risk_budget / (entry_unit - stop_unit)
+        quantity = self._size(price=price, fee=fee, equity=equity,
+                              risk_left=loss_limit + realized)
         spendable = min(equity, usdt.available * Decimal("0.98"))
         quantity = min(quantity, spendable / entry_unit)
         if instrument.max_market_size is not None:
@@ -593,6 +593,14 @@ class DemoTrader:
         if order is None or not order.terminal:
             raise TraderError("Рыночная покупка не подтвердилась вовремя")
         return "OPENED" if self._protect(position, order, instrument) else "HOLD"
+
+    def _size(self, *, price: Decimal, fee: Decimal, equity: Decimal, risk_left: Decimal) -> Decimal:
+        """BTC quantity before balance and lot limits: risk-per-trade at the stop."""
+        risk = self.settings.risk
+        cost_rate = fee + self.settings.slippage
+        entry_unit = price * (1 + cost_rate)
+        stop_unit = price * (1 - risk.stop_loss_pct) * (1 - cost_rate)
+        return min(equity * risk.risk_per_trade, risk_left) / (entry_unit - stop_unit)
 
     def _protect(self, position: Position, order: OrderStatus, instrument: SpotInstrument) -> bool:
         if order.side != "buy":
@@ -666,7 +674,7 @@ class DemoTrader:
             raise TraderError("Рыночная продажа не подтвердилась вовремя")
         refreshed = self.store.active_position()
         assert refreshed is not None
-        self._finish(refreshed, order, "SIGNAL")
+        self._finish(refreshed, order, self.CLOSE_REASON)
 
     def _finish(self, position: Position, order: OrderStatus, reason: str) -> None:
         if order.side != "sell" or position.net_btc is None or position.entry_cost_usdt is None:
@@ -680,7 +688,7 @@ class DemoTrader:
         self.store.update(position.id, state="CLOSED", closed_at=now.isoformat(), pnl_usdt=pnl, exit_reason=reason)
         self.store.event(now, "CLOSE", f"{reason} {order.filled_btc} @ {order.avg_price} pnl {pnl}")
         label = {"TAKE_PROFIT": "тейк-профит", "STOP_LOSS": "стоп-лосс", "SIGNAL": "сигнал SELL",
-                 "EMERGENCY": "аварийное закрытие"}.get(reason, reason)
+                 "EMERGENCY": "аварийное закрытие", "TIME": "истекло время удержания"}.get(reason, reason)
         self._say(f"ПРОДАЖА ({label}): {order.filled_btc} BTC по {order.avg_price}; PnL {pnl:.2f} USDT")
         self._notify(f"ПРОДАЖА ({label}) {order.filled_btc} BTC по {order.avg_price} USDT. "
                      f"PnL {pnl:+.2f} USDT. Капитал стратегии {self.equity():.2f} USDT.")

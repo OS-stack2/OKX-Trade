@@ -43,6 +43,8 @@ from bot.bot_ledger import read_bot_holdings
 from bot.run_monitor import RunMonitor, monitor_path_from_env
 from bot.news_radar import (RSS_FEEDS, TELEGRAM_CHANNELS, DeepSeekClassifier, NewsRadar, NewsStore,
                             active_brake, news_state_path_from_env, paper_stats, run_forever)
+from bot.news_trader import (RESUME_PHRASE as NEWS_RESUME_PHRASE, NewsFeed, NewsTrader, NewsTraderSettings,
+                             cached_market, news_trader_state_path_from_env, run_forever as news_run_forever)
 from config import _read_env_file
 import logging
 from config import Config, ConfigError
@@ -146,6 +148,59 @@ def _record_run(name: str, ok: bool, detail: str) -> None:
                 alerter.send_text("OKX Demo: " + message)
     except Exception:
         pass
+
+
+def _news_trade_command(args: argparse.Namespace) -> int:
+    store = TraderStore(news_trader_state_path_from_env())
+    if args.news_trade_resume is not None:
+        if args.news_trade_resume == NEWS_RESUME_PHRASE and store.get_meta("halted"):
+            store.set_meta("halted", None)
+            print("Новостной бот: HALT снят; следующий тик сверит позицию с OKX")
+            return 0
+        print("Новостной бот: неверная фраза или остановки нет", file=sys.stderr)
+        return 1
+    if args.news_trade_status:
+        halted = store.get_meta("halted")
+        position = store.active_position()
+        closed = store.closed_positions()
+        print(f"Новостной бот: {'HALTED ' + halted if halted else 'работает'}")
+        print("Позиция: " + ("нет" if position is None else
+                             f"{position.state} {position.net_btc or position.planned_btc} BTC, "
+                             f"вход {position.entry_price} в {position.opened_at[11:19]} UTC"))
+        pnl = sum((p.pnl_usdt or Decimal(0)) for p in closed)
+        print(f"Закрыто сделок: {len(closed)}; PnL {pnl:+.2f} USDT")
+        for item in closed[-10:]:
+            print(f"  {item.opened_at[:16]} → {item.exit_reason}: PnL {item.pnl_usdt:+.2f}")
+        return 1 if halted else 0
+    try:
+        settings = NewsTraderSettings.from_env_file()
+        client = DemoTradeClient.from_env_file()
+    except ConfigError as exc:
+        print(f"Новостной бот: BLOCK — {exc}", file=sys.stderr)
+        return 1
+    public = OkxClient(client.config)
+    alerter = TelegramAlerter.from_env_file()
+
+    def price() -> Decimal:
+        evidence = get_public_quote_evidence(public)
+        if evidence.last_price is None:
+            raise OkxError("ticker unavailable")
+        return evidence.last_price
+
+    trader = NewsTrader(feed=NewsFeed(news_state_path_from_env(), store), news_settings=settings,
+                        client=client, store=store,
+                        market_provider=cached_market(lambda: read_spot_instrument(public), price),
+                        notifier=alerter.send_text if alerter is not None else None, brake=active_brake)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    def on_report(report) -> None:
+        for line in report.lines:
+            logging.info("%s: %s", report.status, line)
+
+    print("Новостной бот запущен", flush=True)
+    news_run_forever(trader, on_report=on_report,
+                     on_heartbeat=lambda ok: _record_run("news-trader", ok, "ошибки чтения OKX подряд"))
+    return 0
 
 
 def _news_command(args: argparse.Namespace) -> int:
@@ -272,6 +327,9 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--demo-report", action="store_true", help="Weekly summary of both Demo bots to Telegram")
     commands.add_argument("--demo-report-final", action="store_true", help="Final 2-month Demo test summary to Telegram")
     commands.add_argument("--news-radar", action="store_true", help="Run the news radar loop (alerts, brake, paper stats)")
+    commands.add_argument("--news-trade", action="store_true", help="Run the Demo news trader loop")
+    commands.add_argument("--news-trade-status", action="store_true", help="Show the Demo news trader journal")
+    commands.add_argument("--news-trade-resume", metavar="PHRASE", help="Clear a news trader HALT after manual review")
     commands.add_argument("--news-status", action="store_true", help="Show news radar paper statistics")
     commands.add_argument("--trend-once", action="store_true", help="One daily Demo trend-allocator cycle")
     commands.add_argument("--trend-status", action="store_true", help="Show the Demo trend-allocator book")
@@ -481,6 +539,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Свежесть GET не подтверждает защиту позиции; торговля отключена")
         return report.exit_code
 
+    if args.news_trade or args.news_trade_status or args.news_trade_resume is not None:
+        return _news_trade_command(args)
+
     if args.news_radar or args.news_status:
         return _news_command(args)
 
@@ -497,7 +558,8 @@ def main(argv: list[str] | None = None) -> int:
             text = build_report(trader=TraderStore(trader_state_path_from_env()),
                                 trend=TrendStore(trend_state_path_from_env()), trend_budget=budget,
                                 price=price, now=datetime.now(timezone.utc), final=args.demo_report_final,
-                                news=NewsStore(news_state_path_from_env()))
+                                news=NewsStore(news_state_path_from_env()),
+                                news_trader=TraderStore(news_trader_state_path_from_env()))
         except (OSError, sqlite3.Error, TraderError) as exc:
             print(f"Сводка: BLOCK — {exc}", file=sys.stderr)
             return 1
