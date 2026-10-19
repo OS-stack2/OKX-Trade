@@ -599,3 +599,21 @@ sudo systemctl daemon-reload && sudo systemctl enable --now okx-demo-runmon.time
 ```
 
 В `.env`: `OKX_RUNMON_STATE_PATH=/var/lib/okx-watchdog/run_monitor.sqlite3`.
+
+## Новостной радар (этап 6)
+
+`--news-radar` — постоянно работающая служба `okx-news-radar.service`. **Ордеров она не ставит.** Каждые 30 секунд читает публичные превью Telegram-каналов (Watcher Guru, Wu Blockchain, Cointelegraph), каждые 2 минуты — RSS (CoinDesk, The Block, Decrypt, Bitcoin Magazine, пресс-релизы ФРС и SEC). Каждую свежую новость (опубликована не раньше 30 минут назад) DeepSeek оценивает: относится ли к BTC, направление, сила 0–3, подтверждённый факт или слух, свежая ли.
+
+* **Радар:** сила ≥ 2 → сообщение в Telegram с сутью, направлением, источником и задержкой «мы увидели через N с».
+* **Тормоз:** подтверждённая медвежья новость силы 3 → оба Demo-бота 2 часа не покупают (продажи и защитные ордера работают). Слухи тормоз не включают.
+* **Бумажная торговля:** для каждой направленной новости записываются цена BTC за минуту до публикации, в момент, когда мы увидели, и через 1/5/30/60 минут (по минутным свечам OKX). `--news-status` и еженедельная сводка показывают, сколько цена успевала сдвинуться до нас и сколько принесла бы сделка по новости после комиссии 0,2%.
+
+При первом чтении источника всё, что уже есть, сохраняется без разбора — перезапуск не рассылает старые новости повторно. Сбои отслеживает `bot.run_monitor` (нет успешного цикла дольше 10 минут).
+
+```bash
+sudo install -o root -g root -m 644 deploy/systemd/okx-news-radar.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now okx-news-radar.service
+./.venv/bin/python main.py --news-status
+```
+
+В `.env`: `OKX_DEEPSEEK_API_KEY=...`, `OKX_NEWS_STATE_PATH=/var/lib/okx-watchdog/news_radar.sqlite3`.

@@ -199,7 +199,8 @@ class TrendTrader:
                  price_provider: Callable[[], Decimal], settings: TrendSettings = TrendSettings(),
                  notifier: Callable[[str], object] | None = None,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 sleeper: Callable[[float], None] = time.sleep) -> None:
+                 sleeper: Callable[[float], None] = time.sleep,
+                 brake: Callable[[datetime], str | None] | None = None) -> None:
         self.client = client
         self.store = store
         self.closes_provider = closes_provider
@@ -209,6 +210,7 @@ class TrendTrader:
         self.notifier = notifier
         self.clock = clock
         self.sleep = sleeper
+        self.brake = brake
 
     def _notify(self, text: str) -> None:
         if self.notifier is not None:
@@ -267,6 +269,8 @@ class TrendTrader:
                 status = self._rebalance(book, target, price, equity, day.isoformat(), lines)
                 if status == "HALTED":
                     return TrendReport(status, tuple(lines))
+                if status == "BRAKED":
+                    return TrendReport("HOLD", tuple(lines))
             self.store.set(last_day=day.isoformat())
             return TrendReport(status, tuple(lines))
         except TraderError as exc:
@@ -282,6 +286,11 @@ class TrendTrader:
         instrument = self.instrument_provider()
         delta_usdt = target * equity - book.btc * price
         if delta_usdt > 0:
+            reason = self.brake(self.clock()) if self.brake is not None else None
+            if reason:
+                # Not marked as processed: the next hourly run retries after the brake.
+                lines.append(f"Докупка отложена: тормоз по новостям — {reason}")
+                return "BRAKED"
             side = "buy"
             size = _floor(min(delta_usdt, book.usdt * Decimal("0.995")) / price, instrument.lot_size)
         else:

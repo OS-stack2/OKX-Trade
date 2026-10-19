@@ -49,7 +49,7 @@ class RunMonitorTests(unittest.TestCase):
 
     def test_never_seen_bot_starts_the_clock_instead_of_alerting(self):
         self.assertEqual(check_stale(self.monitor, NOW, None, lambda _t: True), [])
-        self.assertEqual(len(check_stale(self.monitor, NOW + timedelta(hours=4), None, lambda _t: True)), 2)
+        self.assertEqual(len(check_stale(self.monitor, NOW + timedelta(hours=4), None, lambda _t: True)), 3)
 
 
 if __name__ == "__main__":

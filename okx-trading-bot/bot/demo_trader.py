@@ -402,7 +402,8 @@ class DemoTrader:
                  notifier: Callable[[str], object] | None = None,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  sleeper: Callable[[float], None] | None = None,
-                 signal_provider: Callable[[tuple], StrategyResult] = evaluate_signal) -> None:
+                 signal_provider: Callable[[tuple], StrategyResult] = evaluate_signal,
+                 brake: Callable[[datetime], str | None] | None = None) -> None:
         self.client = client
         self.store = store
         self.market_provider = market_provider
@@ -411,6 +412,7 @@ class DemoTrader:
         self.clock = clock
         self.sleep = sleeper or time.sleep
         self.signal_provider = signal_provider
+        self.brake = brake
         self._lines: list[str] = []
 
     # helpers
@@ -543,6 +545,10 @@ class DemoTrader:
         now = self.clock()
         day = now.date().isoformat()
         risk = self.settings.risk
+        reason = self.brake(now) if self.brake is not None else None
+        if reason:
+            self._say(f"BUY пропущен: тормоз по новостям — {reason}")
+            return "HOLD"
         if self.store.entries_on(day) >= risk.max_new_entries_per_day:
             self._say("BUY пропущен: лимит входов за сутки")
             return "HOLD"

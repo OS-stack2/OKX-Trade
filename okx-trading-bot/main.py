@@ -41,6 +41,10 @@ from bot.market_data import read_spot_instrument
 from bot.demo_report import build_report
 from bot.bot_ledger import read_bot_holdings
 from bot.run_monitor import RunMonitor, monitor_path_from_env
+from bot.news_radar import (RSS_FEEDS, TELEGRAM_CHANNELS, DeepSeekClassifier, NewsRadar, NewsStore,
+                            active_brake, news_state_path_from_env, paper_stats, run_forever)
+from config import _read_env_file
+import logging
 from config import Config, ConfigError
 import sqlite3
 
@@ -114,7 +118,8 @@ def _demo_trader_command(args: argparse.Namespace) -> int:
         public = OkxClient(client.config)
         trader = DemoTrader(client=client, store=store, settings=settings,
                             market_provider=lambda: get_market_snapshot(public),
-                            notifier=alerter.send_text if alerter is not None else None)
+                            notifier=alerter.send_text if alerter is not None else None,
+                            brake=active_brake)
         report = trader.run_once()
     except (ConfigError, TraderError, OSError, sqlite3.Error) as exc:
         print(f"Demo-трейдер: BLOCK — {exc}", file=sys.stderr)
@@ -141,6 +146,50 @@ def _record_run(name: str, ok: bool, detail: str) -> None:
                 alerter.send_text("OKX Demo: " + message)
     except Exception:
         pass
+
+
+def _news_command(args: argparse.Namespace) -> int:
+    store = NewsStore(news_state_path_from_env())
+    if args.news_status:
+        rows = store.classified()
+        stats = paper_stats(rows)
+        print(f"Новостной радар: разобрано {stats.items}, оповещений {stats.alerts}, "
+              f"медианная задержка {stats.median_delay_s if stats.median_delay_s is not None else '—'} с")
+        brake = active_brake(datetime.now(timezone.utc), store.path)
+        print(f"Тормоз: {brake or 'нет'}")
+        if stats.pre_move_pct is not None:
+            print(f"Цена ушла в сторону новости ещё до того, как мы её увидели: {stats.pre_move_pct:+.3f}%")
+        for minutes, (n, avg, win) in stats.horizons.items():
+            print(f"  бумажная сделка, выход через {minutes} мин: {n} шт, в среднем {avg:+.3f}% "
+                  f"после комиссий, прибыльных {win:.0f}%")
+        return 0
+    values = _read_env_file(Path(__file__).resolve().parent / ".env")
+    try:
+        classifier = DeepSeekClassifier(values.get("OKX_DEEPSEEK_API_KEY", ""))
+        public = OkxClient(Config.from_environment())
+    except ConfigError as exc:
+        print(f"Новостной радар: BLOCK — {exc}", file=sys.stderr)
+        return 1
+    alerter = TelegramAlerter.from_env_file()
+
+    def price_now() -> Decimal:
+        evidence = get_public_quote_evidence(public)
+        if evidence.last_price is None:
+            raise OkxError("ticker unavailable")
+        return evidence.last_price
+
+    def on_cycle(result) -> None:
+        sources = len(TELEGRAM_CHANNELS) + len(RSS_FEEDS)
+        failed = sum(1 for e in result.errors if e.startswith(("tg:", "rss:")))
+        _record_run("news-radar", failed < sources, "; ".join(result.errors)[:300])
+
+    radar = NewsRadar(store=store, classifier=classifier, price_now=price_now,
+                      minute_candles=lambda: public.get_minute_candles(300),
+                      notifier=alerter.send_text if alerter is not None else None)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    print("Новостной радар запущен", flush=True)
+    run_forever(radar, on_cycle=on_cycle)
+    return 0
 
 
 def _trend_command(args: argparse.Namespace) -> int:
@@ -178,7 +227,8 @@ def _trend_command(args: argparse.Namespace) -> int:
                              closes_provider=lambda: read_daily_closes(public),
                              instrument_provider=lambda: read_spot_instrument(public),
                              price_provider=price,
-                             notifier=alerter.send_text if alerter is not None else None)
+                             notifier=alerter.send_text if alerter is not None else None,
+                             brake=active_brake)
         report = trader.run_once()
     except (ConfigError, OkxError, OSError, sqlite3.Error) as exc:
         print(f"Тренд-бот: BLOCK — {exc}", file=sys.stderr)
@@ -221,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--demo-trade-resume", metavar="PHRASE", help="Clear a Demo trader HALT after manual review")
     commands.add_argument("--demo-report", action="store_true", help="Weekly summary of both Demo bots to Telegram")
     commands.add_argument("--demo-report-final", action="store_true", help="Final 2-month Demo test summary to Telegram")
+    commands.add_argument("--news-radar", action="store_true", help="Run the news radar loop (alerts, brake, paper stats)")
+    commands.add_argument("--news-status", action="store_true", help="Show news radar paper statistics")
     commands.add_argument("--trend-once", action="store_true", help="One daily Demo trend-allocator cycle")
     commands.add_argument("--trend-status", action="store_true", help="Show the Demo trend-allocator book")
     commands.add_argument("--trend-resume", metavar="PHRASE", help="Clear a trend-allocator HALT after manual review")
@@ -429,6 +481,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Свежесть GET не подтверждает защиту позиции; торговля отключена")
         return report.exit_code
 
+    if args.news_radar or args.news_status:
+        return _news_command(args)
+
     if args.demo_report or args.demo_report_final:
         try:
             try:
@@ -441,7 +496,8 @@ def main(argv: list[str] | None = None) -> int:
                 price = None
             text = build_report(trader=TraderStore(trader_state_path_from_env()),
                                 trend=TrendStore(trend_state_path_from_env()), trend_budget=budget,
-                                price=price, now=datetime.now(timezone.utc), final=args.demo_report_final)
+                                price=price, now=datetime.now(timezone.utc), final=args.demo_report_final,
+                                news=NewsStore(news_state_path_from_env()))
         except (OSError, sqlite3.Error, TraderError) as exc:
             print(f"Сводка: BLOCK — {exc}", file=sys.stderr)
             return 1

@@ -102,6 +102,12 @@ class OkxClient:
             raise ValueError("daily candles limit must be 1..300")
         return self._get("/api/v5/market/candles", {"instId": "BTC-USDT", "bar": "1Dutc", "limit": str(limit)})
 
+    def get_minute_candles(self, limit: int = 300) -> list[Any]:
+        """Last 1m candles (newest first); about five hours at the maximum limit."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 300:
+            raise ValueError("minute candles limit must be 1..300")
+        return self._get("/api/v5/market/candles", {"instId": "BTC-USDT", "bar": "1m", "limit": str(limit)})
+
     def get_ticker(self) -> list[Any]:
         return self._get("/api/v5/market/ticker", {"instId": "BTC-USDT"})
 
