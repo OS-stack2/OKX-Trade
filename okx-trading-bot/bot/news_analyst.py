@@ -58,6 +58,7 @@ class MarketContext:
     long_short: float | None = None
     long_short_change_24h: float | None = None
     taker_buy_share_4h: float | None = None     # 0..1 of spot taker volume
+    fear_greed: int | None = None               # alternative.me index 0..100 (information only)
     recent_news: tuple[str, ...] = ()
 
     def describe(self) -> str:
@@ -75,7 +76,9 @@ class MarketContext:
                  "Long/short account ratio: " + ("n/a" if self.long_short is None else
                                                  f"{self.long_short:.2f} (24h change {num(self.long_short_change_24h, '', 2)})"),
                  "Spot taker buy share 4h: " + ("n/a" if self.taker_buy_share_4h is None else
-                                                f"{self.taker_buy_share_4h * 100:.0f}%")]
+                                                f"{self.taker_buy_share_4h * 100:.0f}%"),
+                 "Crypto Fear & Greed index: " + ("n/a" if self.fear_greed is None else
+                                                  f"{self.fear_greed}/100 (historically not a reliable timing signal)")]
         if self.recent_news:
             lines.append("Other BTC-relevant headlines in the last 24h:")
             lines += [f"- {item}" for item in self.recent_news]
@@ -95,6 +98,8 @@ class MarketContext:
             parts.append(f"лонг/шорт {self.long_short:.2f}")
         if self.trend_share is not None:
             parts.append(f"тренд {self.trend_share * 5:.0f}/5")
+        if self.fear_greed is not None:
+            parts.append(f"страх/жадность {self.fear_greed}")
         return ", ".join(parts)
 
 
@@ -107,7 +112,8 @@ def _rows(fetch: Callable[[], list[Any]]) -> list[list[Any]] | None:
 
 
 def build_context(public: OkxClient, *, price: float, published_at: datetime, now: datetime,
-                  price_before_news: float | None, recent_news: tuple[str, ...]) -> MarketContext:
+                  price_before_news: float | None, recent_news: tuple[str, ...],
+                  fear_greed: Callable[[], int] | None = None) -> MarketContext:
     """Every piece is optional: a failed endpoint becomes 'n/a', never a crash."""
     change: dict[str, float] = {}
     from_high: dict[str, float] = {}
@@ -146,12 +152,28 @@ def build_context(public: OkxClient, *, price: float, published_at: datetime, no
         sell = sum(float(r[1]) for r in taker[:4])
         buy = sum(float(r[2]) for r in taker[:4])
         taker_share = buy / (buy + sell) if buy + sell > 0 else None
+    index = None
+    if fear_greed is not None:
+        try:
+            index = fear_greed()
+        except Exception:
+            pass
     return MarketContext(
         price=price, minutes_since_news=(now - published_at).total_seconds() / 60,
         pre_move_pct=_pct(price, price_before_news) if price_before_news else None,
         change_pct=change, from_high_pct=from_high, hourly_vol_pct=vol, trend_share=trend,
         funding_pct=funding, oi_change_24h_pct=oi_change, long_short=long_short,
-        long_short_change_24h=ls_change, taker_buy_share_4h=taker_share, recent_news=recent_news)
+        long_short_change_24h=ls_change, taker_buy_share_4h=taker_share, recent_news=recent_news,
+        fear_greed=index)
+
+
+def read_fear_greed(timeout: float = 10) -> int:
+    request = Request("https://api.alternative.me/fng/?limit=1&format=json",
+                      headers={"User-Agent": "Mozilla/5.0 (okx-news-analyst)"})
+    value = int(json.load(urlopen(request, timeout=timeout))["data"][0]["value"])
+    if not 0 <= value <= 100:
+        raise ValueError("Fear & Greed index out of range")
+    return value
 
 
 def recent_headlines(radar_path: Path, now: datetime, exclude_key: str, limit: int = 12) -> tuple[str, ...]:

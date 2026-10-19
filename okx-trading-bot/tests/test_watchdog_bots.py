@@ -36,6 +36,7 @@ class WatchdogBotLedgerTests(unittest.TestCase):
         self.holdings = BotHoldings(D(btc), frozenset({algo} if algo else set()), D("1"))
 
     def test_bot_trade_with_its_oco_is_silent(self):
+        self.assertEqual(self.runner.store.counter("suspicious"), (0, None, None))
         self.runner.run_once()
         self.bot_buys("0.012", "A1")
         report = self.runner.run_once()
@@ -50,6 +51,9 @@ class WatchdogBotLedgerTests(unittest.TestCase):
         self.demo.btc = CurrencyBalance(D("1.5"), D("1"))
         self.assertEqual(self.runner.run_once().status, "SUSPICIOUS")
         self.assertEqual(self.alerts.events, ["WATCHDOG_SUSPICIOUS"])
+        self.assertEqual(self.runner.store.counter("suspicious")[0], 1)
+        self.runner.run_once()
+        self.assertEqual(self.runner.store.counter("suspicious")[0], 2)
 
     def test_foreign_algo_still_alerts(self):
         self.runner.run_once()

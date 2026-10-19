@@ -291,7 +291,6 @@ class WatchdogTests(unittest.TestCase):
         output = StringIO()
         with (patch("main.WatchdogStore") as store,
               patch("main.Watchdog") as runner,
-              patch("main.DecisionJournal", side_effect=AssertionError("Windows journal called")),
               redirect_stdout(output)):
             runner.return_value.run_once.return_value = report
             self.assertEqual(main.main(["--watchdog-once"]), 0)

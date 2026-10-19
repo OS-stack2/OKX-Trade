@@ -204,6 +204,9 @@ class WatchdogStore:
         db.execute("""CREATE TABLE IF NOT EXISTS watchdog_observations (
             id INTEGER PRIMARY KEY, checked_at_utc TEXT NOT NULL,
             status TEXT NOT NULL, snapshot_json TEXT, reasons_json TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS watchdog_counters (
+            name TEXT PRIMARY KEY, value INTEGER NOT NULL, first_at_utc TEXT NOT NULL,
+            last_at_utc TEXT NOT NULL)""")
         db.execute("""CREATE TABLE IF NOT EXISTS watchdog_alerts (
             id INTEGER PRIMARY KEY, created_at_utc TEXT NOT NULL, event TEXT NOT NULL,
             attempted INTEGER NOT NULL CHECK(attempted=1), delivered INTEGER)""")
@@ -272,6 +275,10 @@ class WatchdogStore:
                 VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET health=excluded.health,
                 snapshot_json=excluded.snapshot_json,updated_at_utc=excluded.updated_at_utc""",
                 (new_health, new_json, stamp))
+            if status == "SUSPICIOUS":
+                # Durable: observations are pruned after two days, this count is not.
+                db.execute("INSERT INTO watchdog_counters VALUES('suspicious', 1, ?, ?) ON CONFLICT(name) "
+                           "DO UPDATE SET value=value+1, last_at_utc=excluded.last_at_utc", (stamp, stamp))
             db.execute("INSERT INTO watchdog_observations(checked_at_utc,status,snapshot_json,reasons_json) "
                        "VALUES(?,?,?,?)", (stamp, status, snapshot.to_json() if snapshot else None,
                                            json.dumps(reasons, ensure_ascii=True)))
@@ -285,6 +292,13 @@ class WatchdogStore:
             db.execute("DELETE FROM watchdog_alerts WHERE id <= "
                        "(SELECT COALESCE(MAX(id),0)-? FROM watchdog_alerts)", (MAX_ALERTS,))
             return status, bool(changed), tuple(alerts)
+
+    def counter(self, name: str) -> tuple[int, str | None, str | None]:
+        """(count, first UTC, last UTC) of a durable event counter."""
+        with self._transaction() as db:
+            row = db.execute("SELECT value, first_at_utc, last_at_utc FROM watchdog_counters WHERE name=?",
+                             (name,)).fetchone()
+        return (0, None, None) if row is None else (row[0], row[1], row[2])
 
     def mark_delivery(self, alert_id: int, delivered: bool) -> None:
         with self._transaction() as db:

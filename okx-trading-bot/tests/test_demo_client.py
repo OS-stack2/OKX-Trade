@@ -307,13 +307,6 @@ class DemoClientTests(unittest.TestCase):
             self.assertEqual(main.main(["--demo-check"]), 1)
         self.assertIn("Demo-счёта", error.getvalue())
 
-    def test_order_preview_missing_demo_config_stops_before_public_request(self):
-        error = StringIO()
-        with patch.object(main.DemoClient, "from_env_file", side_effect=ConfigError("Нет локального .env")), \
-             patch.object(main, "OkxClient", side_effect=AssertionError("public request")), redirect_stderr(error):
-            self.assertEqual(main.main(["--order-preview"]), 1)
-        self.assertIn("BLOCK", error.getvalue())
-
 
 if __name__ == "__main__":
     unittest.main()

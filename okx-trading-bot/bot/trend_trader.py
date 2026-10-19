@@ -39,6 +39,7 @@ RESUME_PHRASE = "RESUME OKX DEMO TREND"
 LIMIT_WAIT_SECONDS = 180          # how long a maker order may rest per attempt
 LIMIT_POLL_SECONDS = 5
 MAX_LIMIT_ATTEMPTS = 3            # per day; then fall back to a market order
+MIN_ORDER_USDT = Decimal("1")     # OKX rejects smaller orders (51020), seen live on Demo
 ZERO = Decimal(0)
 
 
@@ -239,7 +240,8 @@ class TrendTrader:
         return status
 
     def _halt(self, reason: str, lines: list[str]) -> TrendReport:
-        self.store.set(halted=f"{self.clock().isoformat()} {reason}")
+        count = int(self.store.meta_value("halts_total") or "0") + 1
+        self.store.set(halted=f"{self.clock().isoformat()} {reason}", halts_total=str(count))
         self._notify(f"АВАРИЙНАЯ ОСТАНОВКА. {reason}. Нужна ручная проверка и --trend-resume.")
         lines.append(f"HALTED: {reason}")
         return TrendReport("HALTED", tuple(lines))
@@ -316,8 +318,9 @@ class TrendTrader:
             size = _floor(min(-delta_usdt / price, book.btc), instrument.lot_size)
             if target == 0:
                 size = _floor(book.btc, instrument.lot_size)
-        if size < instrument.min_size:
-            lines.append(f"Ребалансировка пропущена: {size} BTC меньше минимума {instrument.min_size}")
+        if size < instrument.min_size or size * price < MIN_ORDER_USDT:
+            lines.append(f"Ребалансировка пропущена: {size} BTC меньше минимума OKX "
+                         f"({instrument.min_size} BTC и {MIN_ORDER_USDT} USDT)")
             return "HOLD"
         if side == "sell":
             btc, _ = self.client.get_balances()

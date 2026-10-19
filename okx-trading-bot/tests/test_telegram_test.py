@@ -13,8 +13,6 @@ import unittest
 from unittest.mock import patch
 
 import main
-from bot.execution_engine import ExecutionEngine
-from bot.journal import CycleDraft, CycleStatus, DecisionJournal
 from bot.telegram_alerts import TEST_MESSAGE, TelegramAlerter
 
 
@@ -52,8 +50,6 @@ class TelegramDiagnosticTests(unittest.TestCase):
         output, errors = StringIO(), StringIO()
         with (patch("main.TelegramAlerter.from_env_file", return_value=alerter),
               patch("main.DemoClient.from_env_file", side_effect=AssertionError("OKX called")),
-              patch("main.ExecutionEngine", side_effect=AssertionError("SQLite called")),
-              patch("main.DecisionJournal", side_effect=AssertionError("journal called")),
               redirect_stdout(output), redirect_stderr(errors)):
             result = main.main(["--telegram-test"])
         self.assertEqual(result, 0)
@@ -104,25 +100,3 @@ class TelegramDiagnosticTests(unittest.TestCase):
             self.assertEqual(main.main(["--telegram-test"]), 1)
         self.assertNotIn(FAKE_TOKEN, stderr.getvalue())
         self.assertNotIn(FAKE_CHAT, stderr.getvalue())
-
-    def test_halted_is_durable_before_failed_telegram_delivery(self):
-        path = self.root / "temporary_journal.sqlite3"
-        journal = DecisionJournal(path)
-        now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
-        journal.append(CycleDraft(now, None, "HOLD", CycleStatus.HOLD, "offline test"))
-        engine = ExecutionEngine(journal=journal, clock=lambda: now)
-        engine.emergency_halt("MANUAL_HALT")
-
-        attempts = []
-
-        def failing_transport(request, _timeout):
-            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-                attempts.append(db.execute(
-                    "SELECT halted FROM execution_control WHERE id=1").fetchone()[0])
-            raise RuntimeError(f"private transport URL {FAKE_TOKEN} {FAKE_CHAT}")
-
-        self.assertFalse(self._alerter(failing_transport).notify("HALTED"))
-        self.assertEqual(attempts, [1])
-        restarted = ExecutionEngine(journal=journal, clock=lambda: now)
-        self.assertTrue(restarted.diagnose().halted)
-        self.assertEqual(restarted.halt_reason_code(), "MANUAL_HALT")

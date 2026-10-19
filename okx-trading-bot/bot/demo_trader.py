@@ -36,7 +36,6 @@ from uuid import uuid4
 
 from bot.demo_client import DemoApiCodeError, DemoClient, DemoError
 from bot.market_data import MarketSnapshot, SpotInstrument
-from bot.risk_manager import RiskSettings
 from bot.strategy import Signal, StrategyError, StrategyResult, evaluate_signal
 from config import ConfigError, _read_env_file
 
@@ -254,6 +253,17 @@ class DemoTradeClient(DemoClient):
         self._post(self._CANCEL_ALGOS, [{"algoId": algo_id, "instId": INST_ID}])
 
 
+@dataclass(frozen=True)
+class RiskSettings:
+    risk_per_trade: Decimal = Decimal("0.005")
+    stop_loss_pct: Decimal = Decimal("0.01")
+    take_profit_pct: Decimal = Decimal("0.02")
+    daily_loss_limit_pct: Decimal = Decimal("0.02")
+    max_open_positions: int = 1
+    max_new_entries_per_day: int = 5
+    max_snapshot_age_seconds: int = 60
+
+
 # --- durable state ------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -349,6 +359,10 @@ class TraderStore:
         with self._db() as db:
             rows = db.execute("SELECT * FROM positions WHERE state='CLOSED' ORDER BY id").fetchall()
             return [p for p in map(self._position, rows) if p is not None]
+
+    def count_events(self, kind: str) -> int:
+        with self._db() as db:
+            return db.execute("SELECT COUNT(*) FROM events WHERE kind=?", (kind,)).fetchone()[0]
 
     def entries_on(self, day: str) -> int:
         with self._db() as db:

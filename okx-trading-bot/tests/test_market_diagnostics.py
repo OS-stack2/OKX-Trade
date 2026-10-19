@@ -103,7 +103,6 @@ class MarketDiagnosticTests(unittest.TestCase):
         with (patch.object(main.Config, "from_environment", return_value=Config()),
               patch.object(main, "OkxClient", return_value=client),
               patch.object(main.DemoClient, "from_env_file", side_effect=AssertionError("private GET")),
-              patch.object(main, "DecisionJournal", side_effect=AssertionError("SQLite")),
               redirect_stdout(output)):
             self.assertEqual(main.main(["--market-diagnose"]), 1)
         self.assertEqual(client.calls, ["GET instrument", "GET ticker"])

@@ -98,6 +98,7 @@ class TrendTraderTests(unittest.TestCase):
         self.okx.timeout_on = "/api/v5/trade/order"
         self.assertEqual(self.trader().run_once().status, "HALTED")
         self.assertEqual(self.trader().run_once().status, "HALTED")
+        self.assertEqual(self.store.meta_value("halts_total"), "1")
         self.assertTrue(resume(self.store, RESUME_PHRASE))
         self.now += timedelta(hours=1)
         self.trader().run_once()

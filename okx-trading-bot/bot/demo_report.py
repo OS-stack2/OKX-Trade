@@ -12,7 +12,8 @@ from bot.trend_trader import TrendStore
 
 def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decimal,
                  price: Decimal | None, now: datetime, final: bool = False,
-                 news: NewsStore | None = None, news_trader: TraderStore | None = None) -> str:
+                 news: NewsStore | None = None, news_trader: TraderStore | None = None,
+                 suspicious: int | None = None) -> str:
     since = now - timedelta(days=7)
     lines = ["ИТОГ 2 МЕСЯЦЕВ Demo-теста" if final else "Еженедельная сводка Demo-ботов",
              f"на {now:%Y-%m-%d %H:%M} UTC" + (f", BTC {price:.0f} USDT" if price else "")]
@@ -86,7 +87,11 @@ def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decima
                 lines.append(f"    выход через {minutes} мин: {n} шт, в среднем {avg:+.3f}%, прибыльных {win:.0f}%")
         else:
             lines.append("  бумажных сделок пока нет — сильных подтверждённых новостей не было")
+    if news is not None and news_trader is not None and suspicious is not None:
+        from bot.criteria import describe, evaluate
+        lines += [""] + describe(evaluate(news_trader=news_trader, radar_path=news.path, trend=trend,
+                                          suspicious=suspicious), final=final)
     if final:
-        lines += ["", "Тест окончен. Следующий шаг — разбор с Claude: сверка тренд-бота с бэктестом "
-                      "и решение о реальном счёте. Боты продолжают работать, пока их не выключат."]
+        lines += ["", "Тест окончен. Следующий шаг — разбор с Claude по критериям выше. "
+                      "Боты продолжают работать, пока их не выключат."]
     return "\n".join(lines)

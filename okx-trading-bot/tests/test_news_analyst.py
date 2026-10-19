@@ -88,7 +88,8 @@ class FakePublic:
 class ContextTests(unittest.TestCase):
     def test_context_with_partial_data(self) -> None:
         c = build_context(FakePublic(), price=80000.0, published_at=NOW - timedelta(minutes=3), now=NOW,
-                          price_before_news=79800.0, recent_news=("10:00 UTC [bullish, impact 2] x",))
+                          price_before_news=79800.0, recent_news=("10:00 UTC [bullish, impact 2] x",),
+                          fear_greed=lambda: 72)
         self.assertAlmostEqual(c.change_pct["1h"], (80000 / 79995 - 1) * 100)
         self.assertAlmostEqual(c.funding_pct, 0.03)
         self.assertAlmostEqual(c.oi_change_24h_pct, 10.0)
@@ -99,6 +100,8 @@ class ContextTests(unittest.TestCase):
         self.assertIn("Long/short account ratio: n/a", text)
         self.assertIn("Move since publication (toward the news): +0.25%", text)
         self.assertIn("с новости +0.25%", c.short_ru())
+        self.assertIn("страх/жадность 72", c.short_ru())
+        self.assertIn("Crypto Fear & Greed index: 72/100", text)
 
 
 class ScriptedAnalyst:
