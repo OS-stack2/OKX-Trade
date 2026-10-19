@@ -13,7 +13,7 @@ from bot.trend_trader import TrendStore
 def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decimal,
                  price: Decimal | None, now: datetime, final: bool = False,
                  news: NewsStore | None = None, news_trader: TraderStore | None = None,
-                 suspicious: int | None = None) -> str:
+                 suspicious: int | None = None, ema_enabled: bool = True) -> str:
     since = now - timedelta(days=7)
     lines = ["ИТОГ 2 МЕСЯЦЕВ Demo-теста" if final else "Еженедельная сводка Demo-ботов",
              f"на {now:%Y-%m-%d %H:%M} UTC" + (f", BTC {price:.0f} USDT" if price else "")]
@@ -24,8 +24,8 @@ def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decima
     wins = sum(1 for p in closed if (p.pnl_usdt or 0) > 0)
     halted = trader.get_meta("halted")
     active = trader.active_position()
-    lines += ["", "EMA 9/21 (механика):",
-              f"  статус: {'HALTED — ' + halted if halted else 'работает'}",
+    ema_state = 'HALTED — ' + halted if halted else ('работает' if ema_enabled else 'выведен из работы 19.10')
+    lines += ["", "EMA 9/21:", f"  статус: {ema_state}",
               f"  сделок всего {len(closed)} (прибыльных {wins}), за неделю {len(week)}",
               f"  PnL всего {total:+.2f} USDT, за неделю {sum((p.pnl_usdt or Decimal(0)) for p in week):+.2f}",
               f"  позиция: {'нет' if active is None else f'{active.state} {active.net_btc} BTC от {active.entry_price}'}"]

@@ -310,7 +310,9 @@ def _report_command(args: argparse.Namespace) -> int:
                             price=price, now=datetime.now(timezone.utc), final=args.demo_report_final,
                             news=NewsStore(news_state_path_from_env()),
                             news_trader=TraderStore(news_trader_state_path_from_env()),
-                            suspicious=_suspicious_count())
+                            suspicious=_suspicious_count(),
+                            ema_enabled=_read_env_file(Path(__file__).resolve().parent / ".env")
+                            .get("OKX_TRADER_ENABLED") == "1")
     except (OSError, sqlite3.Error, TraderError) as exc:
         print(f"Сводка: BLOCK — {exc}", file=sys.stderr)
         return 1
