@@ -254,6 +254,15 @@ class DemoTraderTests(unittest.TestCase):
         self.assertTrue(abandon_position(self.store, ABANDON_PHRASE, self.now))
         self.assertIsNone(self.store.active_position())
 
+    def test_owner_close_now(self) -> None:
+        self.trader().run_once()
+        algo = self.store.active_position().algo_id
+        report = self.trader().close_now()
+        self.assertEqual(report.status, "CLOSED", report.lines)
+        self.assertEqual(self.okx.algos[algo]["state"], "canceled")
+        self.assertEqual(self.store.closed_positions()[0].exit_reason, "MANUAL")
+        self.assertEqual(self.trader().close_now().lines[-1], "Открытой позиции нет")
+
     def test_live_mode_and_unknown_endpoints_are_refused(self) -> None:
         with self.assertRaises(ConfigError):
             DemoTradeClient(Config(mode="READ_ONLY"), DemoCredentials("k", "s", "p"))

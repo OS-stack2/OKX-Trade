@@ -500,6 +500,32 @@ class DemoTrader:
             self._say(f"Цикл пропущен: {exc}")
             return CycleReport("ERROR", tuple(self._lines))
 
+    def close_now(self) -> CycleReport:
+        """Owner-requested exit: reconcile, then cancel the OCO and sell the position at market."""
+        self._lines = []
+        if self.store.get_meta("halted"):
+            return CycleReport("HALTED", ("Сначала снимите HALT после ручной проверки",))
+        try:
+            self._reconcile()
+            position = self.store.active_position()
+            if position is None:
+                return CycleReport("HOLD", tuple(self._lines) + ("Открытой позиции нет",))
+            if position.state != "OPEN":
+                raise TraderError(f"Позиция в состоянии {position.state}; закрыть вручную нельзя")
+            reason = self.CLOSE_REASON
+            self.CLOSE_REASON = "MANUAL"
+            try:
+                self._close_by_signal(position)
+            finally:
+                self.CLOSE_REASON = reason
+            return CycleReport("CLOSED", tuple(self._lines))
+        except TraderError as exc:
+            return self._halt(str(exc))
+        except OrderUncertain as exc:
+            return self._halt(f"Неопределённый результат торгового запроса: {exc}")
+        except DemoError as exc:
+            return CycleReport("ERROR", (f"Закрытие не выполнено: {exc}",))
+
     # --- reconciliation -----------------------------------------------------------
     def _reconcile(self) -> bool:
         position = self.store.active_position()
@@ -688,13 +714,17 @@ class DemoTrader:
         self.store.update(position.id, state="CLOSED", closed_at=now.isoformat(), pnl_usdt=pnl, exit_reason=reason)
         self.store.event(now, "CLOSE", f"{reason} {order.filled_btc} @ {order.avg_price} pnl {pnl}")
         label = {"TAKE_PROFIT": "тейк-профит", "STOP_LOSS": "стоп-лосс", "SIGNAL": "сигнал SELL",
-                 "EMERGENCY": "аварийное закрытие", "TIME": "истекло время удержания"}.get(reason, reason)
+                 "EMERGENCY": "аварийное закрытие", "TIME": "истекло время удержания",
+                 "MANUAL": "закрыто по команде владельца"}.get(reason, reason)
         self._say(f"ПРОДАЖА ({label}): {order.filled_btc} BTC по {order.avg_price}; PnL {pnl:.2f} USDT")
         self._notify(f"ПРОДАЖА ({label}) {order.filled_btc} BTC по {order.avg_price} USDT. "
                      f"PnL {pnl:+.2f} USDT. Капитал стратегии {self.equity():.2f} USDT.")
 
 
 ABANDON_PHRASE = "ABANDON OKX DEMO POSITION"
+
+
+CLOSE_PHRASE = "CLOSE OKX DEMO POSITION"
 
 
 def resume(store: TraderStore, phrase: str, now: datetime) -> bool:

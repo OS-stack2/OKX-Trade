@@ -33,7 +33,7 @@ from bot.growth_research import (ResearchConfig, ResearchError, ResearchReport,
                                  load_candles_csv, okx_taker_debit_rate, research)
 from bot.history_download import HistoryError, RESEARCH_BARS, download_history, save_history_csv
 from bot.market_data import Candle, SpotInstrument
-from bot.demo_trader import (DemoTradeClient, DemoTrader, TraderError, TraderSettings, TraderStore,
+from bot.demo_trader import (CLOSE_PHRASE, DemoTradeClient, DemoTrader, TraderError, TraderSettings, TraderStore,
                              abandon_position, resume, trader_state_path_from_env)
 from bot.trend_trader import (TrendSettings, TrendStore, TrendTrader, read_daily_closes,
                               resume as trend_resume, trend_state_path_from_env)
@@ -117,7 +117,11 @@ def _demo_trader_command(args: argparse.Namespace) -> int:
                 print(f"  {item.closed_at} {item.exit_reason}: {item.net_btc} BTC, вход {item.entry_price}, "
                       f"PnL {item.pnl_usdt:+.2f}")
             return 1 if halted else 0
-        settings = TraderSettings.from_env_file()
+        if args.demo_trade_close is not None and args.demo_trade_close != CLOSE_PHRASE:
+            print("Demo-трейдер: неверная фраза закрытия", file=sys.stderr)
+            return 1
+        settings = (TraderSettings() if args.demo_trade_close is not None
+                    else TraderSettings.from_env_file())
         client = DemoTradeClient.from_env_file()
         alerter = TelegramAlerter.from_env_file()
         public = OkxClient(client.config)
@@ -125,7 +129,7 @@ def _demo_trader_command(args: argparse.Namespace) -> int:
                             market_provider=lambda: get_market_snapshot(public),
                             notifier=alerter.send_text if alerter is not None else None,
                             brake=active_brake)
-        report = trader.run_once()
+        report = trader.close_now() if args.demo_trade_close is not None else trader.run_once()
     except (ConfigError, TraderError, OSError, sqlite3.Error) as exc:
         print(f"Demo-трейдер: BLOCK — {exc}", file=sys.stderr)
         _record_run("demo-trader", False, str(exc))
@@ -358,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_argument("--trend-once", action="store_true", help="One daily Demo trend-allocator cycle")
     commands.add_argument("--trend-status", action="store_true", help="Show the Demo trend-allocator book")
     commands.add_argument("--trend-resume", metavar="PHRASE", help="Clear a trend-allocator HALT after manual review")
+    commands.add_argument("--demo-trade-close", metavar="PHRASE", help="Close the EMA trader position at market")
     commands.add_argument("--demo-trade-abandon", metavar="PHRASE", help="Stop tracking a position closed manually on OKX")
     parser.add_argument("--history-bars", type=int, default=RESEARCH_BARS, metavar="COUNT", help="Closed candles to download (default 17280)")
     parser.add_argument("--history-output", type=Path, default=Path("data/btc_usdt_15m.csv"), metavar="CSV")
@@ -597,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
         return _trend_command(args)
 
     if args.demo_trade_once or args.demo_trade_status or args.demo_trade_resume is not None \
-            or args.demo_trade_abandon is not None:
+            or args.demo_trade_abandon is not None or args.demo_trade_close is not None:
         return _demo_trader_command(args)
 
     if args.watchdog_once:

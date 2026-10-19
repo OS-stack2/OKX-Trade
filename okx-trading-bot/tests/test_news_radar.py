@@ -191,6 +191,7 @@ class BrakeInTradersTests(DemoTraderTests):
     test_daily_entry_limit = None
     test_externally_canceled_oco_halts = None
     test_abandon_after_manual_close = None
+    test_owner_close_now = None
 
 
 if __name__ == "__main__":
