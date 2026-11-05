@@ -14,7 +14,8 @@ def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decima
                  price: Decimal | None, now: datetime, final: bool = False,
                  news: NewsStore | None = None, news_trader: TraderStore | None = None,
                  suspicious: int | None = None, ema_enabled: bool = True,
-                 futures: object | None = None, futures_settings: object | None = None) -> str:
+                 futures: object | None = None, futures_settings: object | None = None,
+                 futures_price: Decimal | None = None) -> str:
     since = now - timedelta(days=7)
     lines = ["ИТОГ 2 МЕСЯЦЕВ Demo-теста" if final else "Еженедельная сводка Demo-ботов",
              f"на {now:%Y-%m-%d %H:%M} UTC" + (f", BTC {price:.0f} USDT" if price else "")]
@@ -92,8 +93,8 @@ def build_report(*, trader: TraderStore, trend: TrendStore, trend_budget: Decima
         from bot.criteria import describe_futures, evaluate_futures
         from bot.futures_trader import summary_lines
         lines += ["", "Фьючерс-эксперимент (агрессивный трейдер, BTC-USDT-SWAP, до 16.02.2027):"]
-        lines += summary_lines(futures, futures_settings, price)
-        lines += describe_futures(evaluate_futures(futures, futures_settings, price), final=False)
+        lines += summary_lines(futures, futures_settings, futures_price)
+        lines += describe_futures(evaluate_futures(futures, futures_settings, futures_price), final=False)
     if news is not None and news_trader is not None and suspicious is not None:
         from bot.criteria import describe, evaluate
         lines += [""] + describe(evaluate(news_trader=news_trader, radar_path=news.path, trend=trend,

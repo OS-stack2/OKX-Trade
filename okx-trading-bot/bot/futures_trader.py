@@ -156,8 +156,13 @@ class FuturesClient(DemoTradeClient):
     _POSITIONS = "/api/v5/account/positions"
     _POS_HISTORY = "/api/v5/account/positions-history"
     _SET_LEVER = "/api/v5/account/set-leverage"
-    _ALLOWED_PATHS = DemoTradeClient._ALLOWED_PATHS | frozenset({_POSITIONS, _POS_HISTORY})
+    _TICKER = "/api/v5/market/ticker"
+    _ALLOWED_PATHS = DemoTradeClient._ALLOWED_PATHS | frozenset({_POSITIONS, _POS_HISTORY, _TICKER})
     _POST_PATHS = DemoTradeClient._POST_PATHS | frozenset({_SET_LEVER})
+
+    def get_demo_price(self) -> Decimal:
+        """Last price of the simulated Demo market, where the orders fill (it differs from the live market)."""
+        return read_swap_price(self)
 
     def set_leverage(self, lever: int, pos_side: str) -> None:
         if not 1 <= lever <= 10 or pos_side not in ("long", "short"):
@@ -702,7 +707,8 @@ class FuturesTrader:
                  f"Book: start {self.settings.budget_usdt} USDT, realized now {equity:.2f} USDT, "
                  f"unrealized {upl:+.2f}; stop-out level {self.book_floor():.0f} USDT.",
                  f"Entries today: {self.store.entries_on(now.date().isoformat())} of "
-                 f"{self.settings.max_entries_per_day}.", f"BTC-USDT-SWAP price: {price}"]
+                 f"{self.settings.max_entries_per_day}.",
+                 f"BTC-USDT-SWAP price where you trade (OKX Demo, it can differ from the live market by ~1%): {price}"]
         if position is not None and position.entry_price is not None:
             held = (now - datetime.fromisoformat(position.opened_at)).total_seconds() / 3600
             lines.append(f"Open position: {position.side.upper()} {position.contracts} contracts "
@@ -722,7 +728,8 @@ class FuturesTrader:
             lines.append("Your recent decisions:")
             lines += [f"- {d['at'][5:16]} {d['trigger']}: {d['action']} ({d['confidence']}%) at {d['price']}"
                       for d in decisions]
-        lines += ["", "Market context:", self.market_text(now)]
+        lines += ["", "Market context (live OKX market; use it for direction, not for exact levels):",
+                  self.market_text(now)]
         return "\n".join(lines)
 
     def _decide(self, trigger: Trigger, now: datetime) -> FuturesReport:
@@ -1036,7 +1043,7 @@ def summary_lines(store: FuturesStore, settings: FuturesSettings, price: Decimal
     start = store.get_meta("start_price")
     if start and price:
         hold = (price / Decimal(start) - 1) * 100
-        lines.append(f"  для сравнения: BTC с начала эксперимента {hold:+.1f}% "
+        lines.append(f"  для сравнения: BTC на Demo-рынке с начала эксперимента {hold:+.1f}% "
                      f"(с {Decimal(start):.0f} до {price:.0f})")
     reasons: dict[str, int] = {}
     for p in closed:

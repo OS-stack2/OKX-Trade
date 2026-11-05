@@ -78,6 +78,8 @@ class FakeSwap:
             return self.ok([{"instId": "BTC-USDT-SWAP", "posSide": side, "mgnMode": "isolated",
                              "pos": str(p["pos"]), "avgPx": str(p["avg"]), "upl": str(self.upl(side)),
                              "liqPx": "1"} for side, p in self.positions.items()])
+        if method == "GET" and path == "/api/v5/market/ticker":
+            return self.ok([{"instId": "BTC-USDT-SWAP", "last": str(self.price)}])
         if method == "GET" and path == "/api/v5/account/positions-history":
             return self.ok(self.history)
         raise AssertionError(f"unexpected {method} {path}")
@@ -259,6 +261,12 @@ class FuturesTraderTests(unittest.TestCase):
         situation = self.analyst.situations[-1]
         self.assertIn("Open position: LONG 1.5 contracts", situation)
         self.assertIn("OPEN_LONG (80%)", situation)
+
+
+    def test_demo_price_comes_from_the_simulated_market(self) -> None:
+        self.okx.price = D("79623.7")
+        self.assertEqual(self.client.get_demo_price(), D("79623.7"))
+        self.assertEqual(self.okx.calls[-1][1], "/api/v5/market/ticker")
 
 
 class HardRuleTests(unittest.TestCase):

@@ -200,6 +200,14 @@ def _futures_settings() -> FuturesSettings:
         return FuturesSettings()
 
 
+def _futures_demo_price() -> Decimal | None:
+    """Demo-market price: the futures book is valued where it trades."""
+    try:
+        return FuturesClient.from_env_file().get_demo_price()
+    except (ConfigError, DemoError, TraderError, OSError):
+        return None
+
+
 def _futures_command(args: argparse.Namespace) -> int:
     store = FuturesStore(futures_state_path_from_env())
     now = datetime.now(timezone.utc)
@@ -211,10 +219,7 @@ def _futures_command(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     if args.futures_status:
-        try:
-            price = read_swap_price(OkxClient(Config.from_environment()))
-        except (ConfigError, OkxError, DemoError, OSError):
-            price = None
+        price = _futures_demo_price()
         print("Фьючерс-трейдер (Demo, BTC-USDT-SWAP):")
         for line in futures_summary(store, _futures_settings(), price):
             print(line)
@@ -253,7 +258,7 @@ def _futures_command(args: argparse.Namespace) -> int:
 
     trader = FuturesTrader(client=client, store=store, settings=settings,
                            analyst=FuturesAnalyst(values.get("OKX_DEEPSEEK_API_KEY", "")),
-                           instrument=instrument, price=lambda: read_swap_price(public),
+                           instrument=instrument, price=client.get_demo_price,
                            market_text=market_text,
                            feed=NewsFeed(radar_path, store, directions=("bullish", "bearish")),
                            notifier=alerter.send_text if alerter is not None else None)
@@ -404,13 +409,14 @@ def _report_command(args: argparse.Namespace) -> int:
                             ema_enabled=_read_env_file(Path(__file__).resolve().parent / ".env")
                             .get("OKX_TRADER_ENABLED") == "1",
                             futures=FuturesStore(futures_state_path_from_env()),
-                            futures_settings=_futures_settings())
+                            futures_settings=_futures_settings(), futures_price=_futures_demo_price())
         if args.futures_report_final:
             from bot.criteria import describe_futures, evaluate_futures
             store, settings = FuturesStore(futures_state_path_from_env()), _futures_settings()
+            demo = _futures_demo_price()
             text = "\n".join([f"ИТОГ фьючерс-эксперимента на {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC",
-                               *futures_summary(store, settings, price), "",
-                               *describe_futures(evaluate_futures(store, settings, price), final=True)])
+                               *futures_summary(store, settings, demo), "",
+                               *describe_futures(evaluate_futures(store, settings, demo), final=True)])
     except (OSError, sqlite3.Error, TraderError) as exc:
         print(f"Сводка: BLOCK — {exc}", file=sys.stderr)
         return 1
