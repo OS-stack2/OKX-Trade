@@ -35,6 +35,21 @@ def naive_paper_30m_pct(radar_path: Path) -> tuple[float | None, int]:
     return (sum(moves) / len(moves), len(moves)) if moves else (None, 0)
 
 
+# Reviewed on 2026-11-05: the Watchdog saw the trend bot's own resting maker order
+# (journaled as pending) and could not attribute it. Fixed the same day; see
+# docs/CRITERIA_2026-12-16.md, "История изменений". Counter rows: first event
+# 2026-10-24T00:10:01.265200Z, second 2026-11-03T00:10:01.611608Z.
+REVIEWED_FALSE_ALARMS_FIRST_AT = "2026-10-24T00:10:01.265200Z"
+REVIEWED_FALSE_ALARMS = 2
+
+
+def unreviewed_suspicious(count: int, first_at: str | None) -> int:
+    """SUSPICIOUS events left after excluding the two reviewed false alarms."""
+    if first_at == REVIEWED_FALSE_ALARMS_FIRST_AT and count >= REVIEWED_FALSE_ALARMS:
+        return count - REVIEWED_FALSE_ALARMS
+    return count
+
+
 def evaluate(*, news_trader: TraderStore, radar_path: Path, trend: TrendStore,
              suspicious: int) -> list[Criterion]:
     closed = news_trader.closed_positions()
@@ -54,7 +69,7 @@ def evaluate(*, news_trader: TraderStore, radar_path: Path, trend: TrendStore,
         Criterion("A3", a3, a3_text),
         Criterion("A4", news_halts == 0, f"аварийных остановок новостного бота: {news_halts}"),
         Criterion("B1", trend_halts == 0, f"аварийных остановок тренд-бота: {trend_halts}"),
-        Criterion("B2", suspicious == 0, f"расхождений учёта (SUSPICIOUS с 19.10): {suspicious}"),
+        Criterion("B2", suspicious == 0, f"расхождений учёта (SUSPICIOUS с 19.10, без 2 разобранных ложных): {suspicious}"),
     ]
 
 

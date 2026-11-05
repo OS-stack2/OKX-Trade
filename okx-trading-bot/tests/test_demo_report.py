@@ -36,6 +36,16 @@ class DemoReportTests(unittest.TestCase):
         self.assertIn("за неделю 1", text)
 
 
+class ReviewedFalseAlarmTests(unittest.TestCase):
+    def test_only_the_two_reviewed_events_are_excluded(self):
+        from bot.criteria import unreviewed_suspicious
+        first = "2026-10-24T00:10:01.265200Z"
+        self.assertEqual(unreviewed_suspicious(2, first), 0)
+        self.assertEqual(unreviewed_suspicious(3, first), 1)
+        self.assertEqual(unreviewed_suspicious(0, None), 0)
+        self.assertEqual(unreviewed_suspicious(1, "2026-12-01T00:00:00Z"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -68,5 +78,5 @@ class CriteriaTests(unittest.TestCase):
                                        suspicious=2), final=True)
             text = "\n".join(failed)
             self.assertIn("❌ B1", text)
-            self.assertIn("❌ B2: расхождений учёта (SUSPICIOUS с 19.10): 2", text)
+            self.assertIn("❌ B2: расхождений учёта (SUSPICIOUS с 19.10, без 2 разобранных ложных): 2", text)
             self.assertIn("тренд-бот: НЕ кандидат", text)

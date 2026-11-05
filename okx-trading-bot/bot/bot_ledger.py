@@ -68,3 +68,19 @@ def read_bot_holdings(env_path: Path | None = None) -> BotHoldings | None:
         return None
     btc += Decimal(meta.get("btc", "0"))
     return BotHoldings(btc, frozenset(algo_ids), external)
+
+
+def read_in_flight_orders(env_path: Path | None = None) -> frozenset[str]:
+    """Client order IDs the bots journaled before placing an order that has not settled yet."""
+    ids: set[str] = set()
+    query = ("SELECT state, buy_client_id, sell_client_id FROM positions "
+             "WHERE state IN ('OPENING','CLOSING')")
+    for path in (trader_state_path_from_env(env_path), news_trader_state_path_from_env(env_path)):
+        for row in _rows(path, query) or []:
+            client_id = row["buy_client_id"] if row["state"] == "OPENING" else row["sell_client_id"]
+            if client_id:
+                ids.add(client_id)
+    for row in _rows(trend_state_path_from_env(env_path), "SELECT value FROM meta WHERE key='pending'") or []:
+        if row["value"]:
+            ids.add(row["value"])
+    return frozenset(ids)

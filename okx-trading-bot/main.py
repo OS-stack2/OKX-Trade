@@ -14,7 +14,8 @@ from pathlib import Path
 import sqlite3
 import sys
 
-from bot.bot_ledger import read_bot_holdings
+from bot.bot_ledger import read_bot_holdings, read_in_flight_orders
+from bot.criteria import unreviewed_suspicious
 from bot.demo_client import DemoClient, DemoError
 from bot.demo_report import build_report
 from bot.demo_trader import (CLOSE_PHRASE, DemoTradeClient, DemoTrader, TraderError, TraderSettings, TraderStore,
@@ -290,7 +291,8 @@ def _trend_command(args: argparse.Namespace) -> int:
 
 def _suspicious_count() -> int | None:
     try:
-        return WatchdogStore(watchdog_path_from_env()).counter("suspicious")[0]
+        count, first_at, _last = WatchdogStore(watchdog_path_from_env()).counter("suspicious")
+        return unreviewed_suspicious(count, first_at)
     except (WatchdogError, OSError):
         return None
 
@@ -367,7 +369,8 @@ def _health_once() -> int:
 def _watchdog_once() -> int:
     try:
         report = Watchdog(store=WatchdogStore(watchdog_path_from_env()),
-                          ledger_loader=read_bot_holdings).run_once()
+                          ledger_loader=read_bot_holdings,
+                          in_flight_loader=read_in_flight_orders).run_once()
     except (WatchdogError, OSError):
         print("Watchdog: отдельный журнал или локальная конфигурация недоступны", file=sys.stderr)
         return 1

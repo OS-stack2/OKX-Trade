@@ -31,6 +31,7 @@ WINDOWS_JOURNAL_PATH = PROJECT_ROOT / "data" / "dry_run_journal.sqlite3"
 MAX_OBSERVATIONS = 576  # Two days at five-minute intervals.
 MAX_ALERTS = 200
 MAX_LIST_ITEMS = 200
+IN_FLIGHT_MAX_AGE_MS = 15 * 60 * 1000  # trend maker orders rest at most ~3 min
 
 
 class WatchdogError(ValueError):
@@ -233,7 +234,8 @@ class WatchdogStore:
 
     def record(self, *, at_utc: datetime, status: str,
                snapshot: WatchdogSnapshot | None, reasons: tuple[str, ...],
-               explained: bool = False) -> tuple[str, bool, tuple[tuple[int, str], ...]]:
+               explained: bool = False,
+               deferred: bool = False) -> tuple[str, bool, tuple[tuple[int, str], ...]]:
         """Atomically save the observation and claim one attempt per new alert."""
         if status not in {"API_UNAVAILABLE", "SUSPICIOUS", "OBSERVED_UNVERIFIED"}:
             raise WatchdogError("Недопустимый статус Watchdog")
@@ -253,6 +255,12 @@ class WatchdogStore:
                 raise WatchdogError("Последний успешный снимок Watchdog отсутствует")
             previous = WatchdogSnapshot.from_json(previous_json) if previous_json is not None else None
             changed = snapshot is not None and previous is not None and snapshot != previous
+            if deferred:
+                # A bot order is resting: compare the settled account with the last
+                # settled snapshot on the next check instead of this mid-trade one.
+                if snapshot is None or status == "SUSPICIOUS":
+                    raise WatchdogError("Отложенная сверка Watchdog противоречива")
+                changed = False
             if changed and explained and status != "SUSPICIOUS":
                 reasons += ("Изменение объяснено журналами Demo-ботов",)
             elif changed:
@@ -270,7 +278,8 @@ class WatchdogStore:
                     events.append("WATCHDOG_SUSPICIOUS")
                 elif changed and not explained:
                     events.append("WATCHDOG_CHANGED")
-                new_health, new_json = "UP", snapshot.to_json()
+                keep = deferred and previous_json is not None
+                new_health, new_json = "UP", (previous_json if keep else snapshot.to_json())
             db.execute("""INSERT INTO watchdog_state(id,health,snapshot_json,updated_at_utc)
                 VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET health=excluded.health,
                 snapshot_json=excluded.snapshot_json,updated_at_utc=excluded.updated_at_utc""",
@@ -314,14 +323,17 @@ class Watchdog:
                  public_factory: Callable[[Config], OkxClient] = OkxClient,
                  alerter_loader: Callable[[], TelegramAlerter | None] = TelegramAlerter.from_env_file,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 ledger_loader: Callable[[], BotHoldings | None] | None = None) -> None:
+                 ledger_loader: Callable[[], BotHoldings | None] | None = None,
+                 in_flight_loader: Callable[[], frozenset[str]] | None = None) -> None:
         self.store = store
         self.demo_loader = demo_loader
         self.public_factory = public_factory
         self.alerter_loader = alerter_loader
         self.clock = clock
         self.ledger_loader = ledger_loader
+        self.in_flight_loader = in_flight_loader
         self._algo_ids: tuple[str, ...] = ()
+        self._open_orders: tuple[tuple[str, int | None], ...] = ()
 
     def _snapshot(self) -> WatchdogSnapshot:
         demo = self.demo_loader()
@@ -353,6 +365,7 @@ class Watchdog:
                 or len(orders) > MAX_LIST_ITEMS or len(algos) > MAX_LIST_ITEMS):
             raise WatchdogError("Полнота открытых ордеров неизвестна")
         order_tokens: list[str] = []
+        open_orders: list[tuple[str, int | None]] = []
         other = 0
         for order in orders:
             if (not isinstance(order, dict) or order.get("instType") != "SPOT"
@@ -363,6 +376,11 @@ class Watchdog:
                     or order.get("state") not in {"live", "partially_filled"}):
                 raise WatchdogError("Открытый SPOT-ордер противоречив")
             other += order["instId"] != "BTC-USDT"
+            try:
+                created = int(order["cTime"])
+            except (KeyError, TypeError, ValueError):
+                created = None
+            open_orders.append((str(order.get("clOrdId") or ""), created))
             order_tokens.append(_signature((order["ordId"], order["instId"], order["state"],
                                             order.get("side"), order.get("sz"),
                                             order.get("accFillSz"))))
@@ -377,6 +395,7 @@ class Watchdog:
                                            str(algo.size_btc), algo.side)))
         if len(set(order_tokens)) != len(order_tokens) or len(set(algo_tokens)) != len(algo_tokens):
             raise WatchdogError("Биржа вернула дублирующийся ордер")
+        self._open_orders = tuple(open_orders)
         return WatchdogSnapshot(btc.total, btc.available, usdt.total, usdt.available,
                                 tuple(sorted(order_tokens)), tuple(sorted(algo_tokens)),
                                 other, unknown_algo_sizes)
@@ -395,6 +414,20 @@ class Watchdog:
             return False
         return abs(snapshot.btc_total - (holdings.external_btc + holdings.btc)) <= BTC_TOLERANCE
 
+    def _bot_order_in_flight(self, snapshot: WatchdogSnapshot, now: datetime) -> bool:
+        """True only when every open order is a fresh BTC-USDT order a bot journaled before placing it."""
+        if (self.in_flight_loader is None or not snapshot.spot_order_count
+                or snapshot.other_spot_orders or snapshot.unknown_algo_sizes):
+            return False
+        try:
+            ids = self.in_flight_loader()
+        except Exception:
+            return False
+        now_ms = int(now.timestamp() * 1000)
+        return all(client_id and client_id in ids and created is not None
+                   and 0 <= now_ms - created <= IN_FLIGHT_MAX_AGE_MS
+                   for client_id, created in self._open_orders)
+
     def run_once(self) -> WatchdogReport:
         now = self.clock()
         try:
@@ -404,8 +437,10 @@ class Watchdog:
                                   ("Время UTC недоступно",), (), False)
         try:
             snapshot = self._snapshot()
-            explained = self._explained_by_bots(snapshot)
-            reasons = (["BTC и Algo-ордера сверены с журналами Demo-ботов"] if explained else
+            deferred = self._bot_order_in_flight(snapshot, now)
+            explained = False if deferred else self._explained_by_bots(snapshot)
+            reasons = (["Ордер Demo-бота в процессе исполнения; сверка отложена"] if deferred else
+                       ["BTC и Algo-ордера сверены с журналами Demo-ботов"] if explained else
                        ["Принадлежность BTC и фактическое покрытие SL неизвестны без журнала стратегии"])
             if snapshot.spot_order_count:
                 reasons.append("Есть открытые SPOT-ордера неизвестного происхождения")
@@ -420,14 +455,17 @@ class Watchdog:
                 reasons.append("Часть BTC зарезервирована без понятного SPOT-ордера")
             if snapshot.usdt_available < snapshot.usdt_total and not snapshot.spot_order_count:
                 reasons.append("Часть USDT зарезервирована без понятного SPOT-ордера")
+            if deferred:
+                reasons = reasons[:1]
             status = "SUSPICIOUS" if len(reasons) > 1 else "OBSERVED_UNVERIFIED"
         except Exception:
             # Never print transport errors: URLs and headers can contain secrets.
-            snapshot, status, explained = None, "API_UNAVAILABLE", False
+            snapshot, status, explained, deferred = None, "API_UNAVAILABLE", False, False
             reasons = ["Публичный или приватный Demo GET недоступен либо ответ противоречив"]
         try:
             status, changed, alerts = self.store.record(at_utc=now, status=status, snapshot=snapshot,
-                                                        reasons=tuple(reasons), explained=explained)
+                                                        reasons=tuple(reasons), explained=explained,
+                                                        deferred=deferred)
         except (WatchdogError, OSError, sqlite3.Error):
             return WatchdogReport("JOURNAL_ERROR", None, False,
                                   ("Отдельный журнал Watchdog недоступен; состояние неизвестно",), (), False)
