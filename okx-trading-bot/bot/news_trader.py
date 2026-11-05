@@ -77,14 +77,17 @@ class NewsSignal:
     key: str = ""
     text: str = ""
     published_at: datetime | None = None
+    direction: str = "bullish"
 
 
 class NewsFeed:
     """Read-only cursor over radar items, starting from 'now' on first use."""
 
-    def __init__(self, radar_path: Path, store: TraderStore) -> None:
+    def __init__(self, radar_path: Path, store: TraderStore,
+                 directions: tuple[str, ...] = ("bullish",)) -> None:
         self.radar_path = radar_path
         self.store = store
+        self.directions = directions
 
     def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         if not self.radar_path.is_file():
@@ -109,13 +112,13 @@ class NewsFeed:
                 break  # still being classified; look again next tick
             last = row["rid"]
             if (found is None and row["state"] == "CLASSIFIED" and row["relevant"] and row["confirmed"]
-                    and not row["stale"] and row["direction"] == "bullish"
+                    and not row["stale"] and row["direction"] in self.directions
                     and (row["impact"] or 0) >= min_impact):
                 seen = datetime.fromisoformat(row["seen_at"])
                 if now - seen <= MAX_SIGNAL_AGE:
                     found = NewsSignal(row["rid"], seen, row["summary"] or "", row["impact"],
                                        row["source"], row["url"], row["key"], row["text"],
-                                       datetime.fromisoformat(row["published_at"]))
+                                       datetime.fromisoformat(row["published_at"]), row["direction"])
         if last != int(cursor):
             self.store.set_meta("news_cursor", str(last))
         return found

@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 
 from bot.demo_trader import trader_state_path_from_env
+from bot.futures_trader import futures_state_path_from_env
 from bot.news_trader import news_trader_state_path_from_env
 from bot.trend_trader import trend_state_path_from_env
 from config import _read_env_file
@@ -23,6 +24,7 @@ class BotHoldings:
     btc: Decimal
     algo_ids: frozenset[str]
     external_btc: Decimal
+    futures_active: bool = False   # isolated swap margin legitimately reserves USDT
 
 
 def _rows(path: Path, query: str) -> list[sqlite3.Row] | None:
@@ -67,7 +69,9 @@ def read_bot_holdings(env_path: Path | None = None) -> BotHoldings | None:
     if "pending" in meta:
         return None
     btc += Decimal(meta.get("btc", "0"))
-    return BotHoldings(btc, frozenset(algo_ids), external)
+    futures = _rows(futures_state_path_from_env(env_path),
+                    "SELECT id FROM positions WHERE state IN ('OPENING','OPEN','CLOSING','SETTLING')")
+    return BotHoldings(btc, frozenset(algo_ids), external, bool(futures))
 
 
 def read_in_flight_orders(env_path: Path | None = None) -> frozenset[str]:

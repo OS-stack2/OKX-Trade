@@ -6,7 +6,7 @@ Run `python main.py --help` for the command list; README.md explains each one.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import logging
@@ -20,6 +20,10 @@ from bot.demo_client import DemoClient, DemoError
 from bot.demo_report import build_report
 from bot.demo_trader import (CLOSE_PHRASE, DemoTradeClient, DemoTrader, TraderError, TraderSettings, TraderStore,
                              abandon_position, resume, trader_state_path_from_env)
+from bot.futures_trader import (CLOSE_PHRASE as FUTURES_CLOSE_PHRASE, FuturesAnalyst, FuturesClient,
+                                FuturesSettings, FuturesStore, FuturesTrader, futures_state_path_from_env,
+                                read_swap_instrument, read_swap_price, resume as futures_resume,
+                                run_forever as futures_run_forever, summary_lines as futures_summary)
 from bot.health_monitor import HealthError, HealthMonitor, HealthStore, health_settings_from_env
 from bot.market_data import (assess_public_quote, get_market_snapshot, get_public_quote_evidence,
                              read_spot_instrument)
@@ -189,6 +193,90 @@ def _news_trade_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _futures_settings() -> FuturesSettings:
+    try:
+        return FuturesSettings.from_env_file()
+    except ConfigError:
+        return FuturesSettings()
+
+
+def _futures_command(args: argparse.Namespace) -> int:
+    store = FuturesStore(futures_state_path_from_env())
+    now = datetime.now(timezone.utc)
+    if args.futures_resume is not None:
+        if futures_resume(store, args.futures_resume, now):
+            print("Фьючерс-трейдер: HALT снят; следующий тик сверит позицию с OKX")
+            return 0
+        print("Фьючерс-трейдер: HALT не снят — неверная фраза, остановки нет или это стоп книги",
+              file=sys.stderr)
+        return 1
+    if args.futures_status:
+        try:
+            price = read_swap_price(OkxClient(Config.from_environment()))
+        except (ConfigError, OkxError, DemoError, OSError):
+            price = None
+        print("Фьючерс-трейдер (Demo, BTC-USDT-SWAP):")
+        for line in futures_summary(store, _futures_settings(), price):
+            print(line)
+        for item in store.closed_positions()[-10:]:
+            print(f"  {item.opened_at[:16]} {item.side} {item.lever}x от {item.entry_price} → "
+                  f"{item.exit_reason}: PnL {item.pnl_usdt:+.2f}")
+        for row in store.recent_decisions(8):
+            detail = json.loads(row["detail"])
+            print(f"  {row['at'][5:16]} {detail.get('trigger', row['trigger'])[:60]}: {row['action']} "
+                  f"({row['confidence']}%)")
+        return 1 if store.get_meta("halted") else 0
+    try:
+        settings = FuturesSettings.from_env_file()
+        client = FuturesClient.from_env_file()
+    except ConfigError as exc:
+        print(f"Фьючерс-трейдер: BLOCK — {exc}", file=sys.stderr)
+        return 1
+    public = OkxClient(client.config)
+    alerter = TelegramAlerter.from_env_file()
+    radar_path = news_state_path_from_env()
+    values = _read_env_file(Path(__file__).resolve().parent / ".env")
+    cache: dict[str, object] = {}
+
+    def instrument():
+        if "at" not in cache or datetime.now(timezone.utc) - cache["at"] > timedelta(hours=1):
+            cache["instrument"], cache["at"] = read_swap_instrument(public), datetime.now(timezone.utc)
+        return cache["instrument"]
+
+    def market_text(at: datetime) -> str:
+        context = build_context(public, price=float(read_swap_price(public)), published_at=at, now=at,
+                                price_before_news=None, recent_news=recent_headlines(radar_path, at, ""),
+                                fear_greed=read_fear_greed)
+        brake = active_brake(at)
+        text = "\n".join(context.describe().splitlines()[2:])  # drop the news-timing lines
+        return text + (f"\nNews radar brake active (bearish shock): {brake}" if brake else "")
+
+    trader = FuturesTrader(client=client, store=store, settings=settings,
+                           analyst=FuturesAnalyst(values.get("OKX_DEEPSEEK_API_KEY", "")),
+                           instrument=instrument, price=lambda: read_swap_price(public),
+                           market_text=market_text,
+                           feed=NewsFeed(radar_path, store, directions=("bullish", "bearish")),
+                           notifier=alerter.send_text if alerter is not None else None)
+    if args.futures_close is not None:
+        if args.futures_close != FUTURES_CLOSE_PHRASE:
+            print("Фьючерс-трейдер: неверная фраза", file=sys.stderr)
+            return 1
+        report = trader.close_now()
+        for line in report.lines:
+            print(line)
+        return 0 if report.status in ("CLOSED", "HOLD") else 1
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    def on_report(report) -> None:
+        for line in report.lines:
+            logging.info("%s: %s", report.status, line)
+
+    print("Фьючерс-трейдер запущен", flush=True)
+    futures_run_forever(trader, on_report=on_report,
+                        on_heartbeat=lambda ok: _record_run("futures-trader", ok, "ошибки подряд"))
+    return 0
+
+
 def _news_command(args: argparse.Namespace) -> int:
     store = NewsStore(news_state_path_from_env())
     if args.news_status:
@@ -314,7 +402,15 @@ def _report_command(args: argparse.Namespace) -> int:
                             news_trader=TraderStore(news_trader_state_path_from_env()),
                             suspicious=_suspicious_count(),
                             ema_enabled=_read_env_file(Path(__file__).resolve().parent / ".env")
-                            .get("OKX_TRADER_ENABLED") == "1")
+                            .get("OKX_TRADER_ENABLED") == "1",
+                            futures=FuturesStore(futures_state_path_from_env()),
+                            futures_settings=_futures_settings())
+        if args.futures_report_final:
+            from bot.criteria import describe_futures, evaluate_futures
+            store, settings = FuturesStore(futures_state_path_from_env()), _futures_settings()
+            text = "\n".join([f"ИТОГ фьючерс-эксперимента на {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC",
+                               *futures_summary(store, settings, price), "",
+                               *describe_futures(evaluate_futures(store, settings, price), final=True)])
     except (OSError, sqlite3.Error, TraderError) as exc:
         print(f"Сводка: BLOCK — {exc}", file=sys.stderr)
         return 1
@@ -476,6 +572,12 @@ def main(argv: list[str] | None = None) -> int:
     add("--news-trade", action="store_true", help="Run the Demo news trader loop")
     add("--news-trade-status", action="store_true", help="News trader journal and analyst decisions")
     add("--news-trade-resume", metavar="PHRASE", help="Clear a news trader HALT after manual review")
+    # aggressive futures experiment
+    add("--futures-trade", action="store_true", help="Run the Demo futures trader loop (BTC-USDT-SWAP)")
+    add("--futures-status", action="store_true", help="Futures trader book, trades and decisions")
+    add("--futures-resume", metavar="PHRASE", help="Clear a futures trader HALT after manual review")
+    add("--futures-close", metavar="PHRASE", help="Close the futures position at market")
+    add("--futures-report-final", action="store_true", help="Final futures experiment summary to Telegram")
     args = parser.parse_args(argv)
 
     if args.demo_trade_once or args.demo_trade_status or args.demo_trade_resume is not None \
@@ -485,9 +587,12 @@ def main(argv: list[str] | None = None) -> int:
         return _trend_command(args)
     if args.news_trade or args.news_trade_status or args.news_trade_resume is not None:
         return _news_trade_command(args)
+    if args.futures_trade or args.futures_status or args.futures_resume is not None \
+            or args.futures_close is not None:
+        return _futures_command(args)
     if args.news_radar or args.news_status:
         return _news_command(args)
-    if args.demo_report or args.demo_report_final:
+    if args.demo_report or args.demo_report_final or args.futures_report_final:
         return _report_command(args)
     if args.market_diagnose:
         return _market_diagnose()

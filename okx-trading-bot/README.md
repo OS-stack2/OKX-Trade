@@ -11,10 +11,11 @@
 | `okx-demo-trend` | **Тренд-бот**, книга 100 USDT: держит в BTC долю, равную доле растущих периодов 20/30/40/50/60 дней (0–100% шагом 20%). Ребалансировка лимитным мейкер-ордером, после 3 неудачных попыток за день — по рынку | каждый час, решение раз в сутки |
 | `okx-news-radar` | **Новостной радар**: Telegram (Watcher Guru, Wu Blockchain, Cointelegraph) и RSS (CoinDesk, The Block, Decrypt, Bitcoin Magazine, ФРС, SEC) → DeepSeek оценивает направление и силу → оповещения, «тормоз», бумажная статистика. Ордеров не ставит | постоянно (30 с / 2 мин) |
 | `okx-news-trader` | **Новостной бот**, книга 1000 USDT: сильную бычью новость разбирает **аналитик** (контекст рынка + DeepSeek в режиме рассуждений) → купить / подождать / пропустить. Покупка 20% книги, биржевой OCO (SL −1%, TP +2%), выход по времени (30–240 мин, выбирает аналитик) | постоянно (2 с) |
+| `okx-futures-trader` | **Фьючерс-эксперимент до 16.02.2027**, книга 1000 USDT, BTC-USDT-SWAP: DeepSeek торгует «как человек» — лонг/шорт, плечо до 3x, сам выбирает размер, стоп и цель. Биржевой OCO на каждой сделке, убыток на стопе ≤ 25% книги, ≤ 6 входов в сутки, **стоп книги на 500 USDT** — закрытие и конец эксперимента. Критерии — раздел E в [CRITERIA](docs/CRITERIA_2026-12-16.md) | постоянно (2 с): решение раз в час (HH:02) и на сильных новостях |
 | `okx-watchdog` | Сверяет Demo-счёт с журналами ботов; необъяснимое изменение → SUSPICIOUS + Telegram | каждые 5 мин |
 | `okx-health` | Проверяет, что Watchdog наблюдает | каждые 5 мин |
 | `okx-demo-runmon` | Тихие сбои: нет успешного запуска бота дольше нормы → Telegram | каждые 15 мин |
-| `okx-demo-report` / `okx-demo-final` | Сводка в Telegram с промежуточной проверкой критериев / итог теста | пн 09:00 UTC / 16.12.2026 09:00 UTC |
+| `okx-demo-report` / `okx-demo-final` / `okx-futures-final` | Сводка в Telegram с промежуточной проверкой критериев / итог теста / итог фьючерс-эксперимента | пн 09:00 UTC / 16.12.2026 / 16.02.2027 09:00 UTC |
 | `okx-demo-trader` | EMA 9/21 — **выведен из работы 19.10.2026** (убыточен), таймер выключен | — |
 
 **Тормоз:** подтверждённая медвежья новость силы 3/3 → 2 часа ни один бот не покупает (продажи и стопы работают).
@@ -25,15 +26,16 @@
 
 | Команда | Назначение |
 |---|---|
-| `--trend-status`, `--news-trade-status`, `--news-status`, `--demo-trade-status` | Состояние ботов, решения аналитика, статистика радара (без запросов к OKX) |
+| `--trend-status`, `--news-trade-status`, `--news-status`, `--futures-status`, `--demo-trade-status` | Состояние ботов, решения аналитика, статистика радара (без запросов к OKX) |
 | `--demo-report` | Отправить сводку сейчас |
 | `--demo-check`, `--market-diagnose`, `--check`, `--signal` | Диагностика: Demo-баланс, параметры инструмента, цена, сигнал EMA |
 | `--telegram-test` | Тестовое сообщение |
 | `--trend-resume "RESUME OKX DEMO TREND"` | Снять аварийную остановку тренд-бота |
 | `--news-trade-resume "RESUME OKX DEMO NEWS TRADER"` | … новостного бота |
+| `--futures-resume "RESUME OKX DEMO FUTURES TRADER"`, `--futures-close "CLOSE OKX DEMO FUTURES POSITION"` | Фьючерс-трейдер: снять остановку (кроме стопа книги), закрыть позицию по рынку |
 | `--demo-trade-resume "RESUME OKX DEMO TRADER"`, `--demo-trade-close "CLOSE OKX DEMO POSITION"`, `--demo-trade-abandon "ABANDON OKX DEMO POSITION"` | EMA-бот: снять остановку, закрыть позицию по рынку, забыть позицию, закрытую вручную |
 
-Остановить бота: `sudo systemctl disable --now okx-demo-trend.timer` (или `okx-news-trader.service`, `okx-news-radar.service`). Открытая позиция новостного бота остаётся под биржевым OCO.
+Остановить бота: `sudo systemctl disable --now okx-demo-trend.timer` (или `okx-news-trader.service`, `okx-news-radar.service`). Открытая позиция новостного бота или фьючерс-трейдера остаётся под биржевым OCO.
 
 ## Аварийная остановка (HALT)
 
@@ -48,7 +50,7 @@ cd okx-trading-bot
 sudo -u okx-watchdog ./.venv/bin/python -m unittest discover -s tests -q
 sudo install -o root -g root -m 644 deploy/systemd/okx-*.service deploy/systemd/okx-*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl restart okx-news-radar okx-news-trader      # постоянные службы подхватывают новый код
+sudo systemctl restart okx-news-radar okx-news-trader okx-futures-trader   # постоянные службы подхватывают новый код
 ```
 
 Таймерные службы подхватывают код при следующем запуске. Новая установка: создать пользователя `okx-watchdog`, клонировать репозиторий, `python3 -m venv .venv`, заполнить `.env` по образцу [.env.example](.env.example) (права 600, владелец `okx-watchdog`; комментарии только на отдельных строках), установить юниты и включить нужные таймеры/службы (`systemctl enable --now …`). Время сервера должно быть синхронизировано: OKX отклоняет подписи с расхождением больше 30 с.

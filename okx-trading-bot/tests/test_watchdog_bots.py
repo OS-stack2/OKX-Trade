@@ -134,6 +134,28 @@ class WatchdogBotLedgerTests(unittest.TestCase):
         trend.set(pending=None)
         self.assertEqual(read_in_flight_orders(env), frozenset({"DT" + "n" * 30}))
 
+    def test_futures_margin_reservation_is_explained_only_by_the_futures_journal(self):
+        self.runner.run_once()
+        self.demo.usdt = CurrencyBalance(D("5000"), D("4500"))   # isolated swap margin
+        self.holdings = BotHoldings(D("0"), frozenset(), D("1"), futures_active=True)
+        report = self.runner.run_once()
+        self.assertEqual(report.status, "OBSERVED_UNVERIFIED", report.reasons)
+        self.holdings = BotHoldings(D("0"), frozenset(), D("1"))
+        self.demo.usdt = CurrencyBalance(D("5000"), D("4400"))
+        self.assertEqual(self.runner.run_once().status, "SUSPICIOUS")
+
+    def test_ledger_sees_an_active_futures_position(self):
+        from bot.futures_trader import FuturesStore
+        env = self.root / ".env"
+        env.write_text(f"OKX_TREND_STATE_PATH={self.root / 'r.sqlite3'}\n"
+                       f"OKX_FUTURES_STATE_PATH={self.root / 'f.sqlite3'}\n", encoding="utf-8")
+        TrendStore(self.root / "r.sqlite3").book(D("100"))
+        futures = FuturesStore(self.root / "f.sqlite3")
+        self.assertFalse(read_bot_holdings(env).futures_active)
+        futures.create_opening(side="long", client_id="FT" + "f" * 30, contracts=D("1"), lever=3,
+                               now=NOW, decision_id=None)
+        self.assertTrue(read_bot_holdings(env).futures_active)
+
     def test_ledger_reads_both_journals_read_only(self):
         env = self.root / ".env"
         env.write_text(f"OKX_TRADER_STATE_PATH={self.root / 't.sqlite3'}\n"

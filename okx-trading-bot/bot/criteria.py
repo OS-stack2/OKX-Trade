@@ -86,3 +86,41 @@ def describe(criteria: list[Criterion], *, final: bool) -> list[str]:
                   "  тренд-бот: " + ("кандидат для реального счёта (держать BTC + трендовый фильтр)" if trend_ok
                                      else "НЕ кандидат: были сбои учёта или аварийные остановки")]
     return lines
+
+
+# --- E. futures experiment, decided on 2027-02-16 ------------------------------------
+
+MIN_FUTURES_TRADES = 20
+
+
+def evaluate_futures(store, settings, price: Decimal | None) -> list[Criterion]:
+    """Pre-registered on 2026-11-05 (section E of the criteria document)."""
+    closed = store.closed_positions()
+    pnl = sum(((p.pnl_usdt or Decimal(0)) for p in closed), Decimal(0))
+    ret = pnl / settings.budget_usdt * 100
+    start = store.get_meta("start_price")
+    hold = (price / Decimal(start) - 1) * 100 if start and price else None
+    book_stops = store.count_events("BOOK_STOP")
+    halts = store.count_events("HALT")
+    return [
+        Criterion("E1", len(closed) >= MIN_FUTURES_TRADES,
+                  f"закрытых сделок {len(closed)} (нужно ≥ {MIN_FUTURES_TRADES})"),
+        Criterion("E2", pnl > 0, f"результат после комиссий и фандинга {pnl:+.2f} USDT (нужно > 0)"),
+        Criterion("E3", hold is not None and ret > hold,
+                  "нет цены для сравнения" if hold is None else
+                  f"доходность книги {ret:+.1f}% против {hold:+.1f}% у простого удержания BTC"),
+        Criterion("E4", book_stops == 0, f"срабатываний стопа книги (−50%): {book_stops}"),
+        Criterion("E5", halts == 0, f"аварийных остановок: {halts}"),
+    ]
+
+
+def describe_futures(criteria: list[Criterion], *, final: bool) -> list[str]:
+    lines = ["Критерии фьючерс-эксперимента 16.02.2027" + ("" if final else " — промежуточно:")]
+    lines += [f"  {'✅' if c.ok else '❌'} {c.code}: {c.text}" for c in criteria]
+    if final:
+        ok = all(c.ok for c in criteria)
+        lines += ["Решение по правилам: " + (
+            "можно обсуждать маленький тест на реальные деньги (≤ $50, отдельный ключ без вывода, "
+            "проверка режима LIVE)" if ok else
+            "эксперимент закрыт; модель остаётся только советником")]
+    return lines

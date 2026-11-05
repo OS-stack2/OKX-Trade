@@ -334,6 +334,7 @@ class Watchdog:
         self.in_flight_loader = in_flight_loader
         self._algo_ids: tuple[str, ...] = ()
         self._open_orders: tuple[tuple[str, int | None], ...] = ()
+        self._futures_active = False
 
     def _snapshot(self) -> WatchdogSnapshot:
         demo = self.demo_loader()
@@ -410,6 +411,7 @@ class Watchdog:
             return False
         if holdings is None or snapshot.spot_order_count or snapshot.unknown_algo_sizes:
             return False
+        self._futures_active = holdings.futures_active
         if not set(self._algo_ids) <= holdings.algo_ids:
             return False
         return abs(snapshot.btc_total - (holdings.external_btc + holdings.btc)) <= BTC_TOLERANCE
@@ -436,6 +438,7 @@ class Watchdog:
             return WatchdogReport("JOURNAL_ERROR", None, False,
                                   ("Время UTC недоступно",), (), False)
         try:
+            self._futures_active = False
             snapshot = self._snapshot()
             deferred = self._bot_order_in_flight(snapshot, now)
             explained = False if deferred else self._explained_by_bots(snapshot)
@@ -453,7 +456,8 @@ class Watchdog:
             if (snapshot.btc_available < snapshot.btc_total and not snapshot.spot_order_count
                     and not (explained and snapshot.algo_order_count)):
                 reasons.append("Часть BTC зарезервирована без понятного SPOT-ордера")
-            if snapshot.usdt_available < snapshot.usdt_total and not snapshot.spot_order_count:
+            if (snapshot.usdt_available < snapshot.usdt_total and not snapshot.spot_order_count
+                    and not (explained and self._futures_active)):
                 reasons.append("Часть USDT зарезервирована без понятного SPOT-ордера")
             if deferred:
                 reasons = reasons[:1]
